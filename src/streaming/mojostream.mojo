@@ -186,3 +186,35 @@ struct MojoStreamFile(Movable):
 
     fn load_time_ms(self) -> Float64:
         return Float64(Int(self.load_ns)) / 1e6
+
+    fn validate_gemma4_shape(self) raises:
+        """ShapeGuard: prüft Gemma-4-Architektur-Invarianten.
+        Wirft Error falls Dimensionen inkonsistent oder unrealistisch sind."""
+        var D   = self.meta.hidden
+        var NH  = self.meta.n_heads
+        var NKV = self.meta.n_kv_heads
+
+        if NH == 0:
+            raise Error("ShapeGuard: n_heads = 0")
+        if NKV == 0:
+            raise Error("ShapeGuard: n_kv_heads = 0")
+        if D % NH != 0:
+            raise Error("ShapeGuard: hidden (" + String(D) +
+                        ") nicht durch n_heads (" + String(NH) + ") teilbar")
+        if NH % NKV != 0:
+            raise Error("ShapeGuard: n_heads (" + String(NH) +
+                        ") nicht durch n_kv_heads (" + String(NKV) + ") teilbar")
+
+        var head_dim = D // NH
+        var kv_dim_expected = NKV * head_dim
+        if self.meta.kv_dim != kv_dim_expected:
+            raise Error("ShapeGuard: kv_dim=" + String(self.meta.kv_dim) +
+                        " ≠ n_kv_heads*head_dim=" + String(kv_dim_expected))
+        if self.meta.n_layers <= 0:
+            raise Error("ShapeGuard: n_layers <= 0")
+        if self.meta.ffn_dim <= 0:
+            raise Error("ShapeGuard: ffn_dim <= 0")
+        var expected_tensors = self.meta.n_layers * TENSORS_PER_LAYER
+        if self.meta.n_tensors != expected_tensors:
+            raise Error("ShapeGuard: n_tensors=" + String(self.meta.n_tensors) +
+                        " ≠ n_layers*8=" + String(expected_tensors))
