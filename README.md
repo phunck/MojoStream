@@ -20,6 +20,7 @@ Branch: main  |  Mojo: 0.26.2  |  Target: x86-64 AVX2  |  License: Apache 2.0
 | BPE Tokenizer (vocab load + encode/decode) | ✅ Implemented | 2026-05 |
 | Numerical Validation Layer 0 | ✅ **[PASS]** rel. RMSE 1.77e-6 | 2026-05 |
 | P95 Benchmark Harness + JSON output | ✅ Stable | 2026-05 |
+| True Streaming Mode (pread, RSS tracking) | ✅ Stable | 2026-05 |
 | Real Gemma 4 Weights (SafeTensors loader) | 📋 Planned | — |
 | All 40 Layers Validated | 📋 Pending real weights | — |
 
@@ -45,9 +46,11 @@ Hardware reference: **Intel i7-7500U** (2 physical cores / 4 logical, AVX2, 16 G
 | Mode | Latency P50 | P95 | t/s (batch=4) | t/s (single) |
 |---|---:|---:|---:|---:|
 | First Light (3 steps) | — | — | 24.6 | **6.2** |
-| Harness 100 steps (seq grows) | 206 ms | 241 ms | 19.4 | 4.9 |
+| Harness 100 steps (seq grows) | 182 ms | 213 ms | 22.0 | 5.5 |
+| **True Streaming** (pread, 1 layer RAM) | 180 ms | — | 22.3 | 5.6 |
 
-I/O pressure: **2.5%** — system is 97.5% compute-bound on SATA SSD.
+**True Streaming** — per step: I/O 30 ms · Compute 149 ms · I/O-Wartezeit **0 ms** (compute-bound).  
+Peak RSS: **248 MB** — konstant über alle Steps, unabhängig von der Modelldateigröße.
 
 ### Numerical Validation
 
@@ -70,7 +73,8 @@ MojoStream/
 │   │                             RMSNorm, PLE, SwiGLU, SiLU
 │   ├── streaming/
 │   │   ├── loader.mojo           Double-buffer ModelRunner (SATA-optimal)
-│   │   └── mojostream.mojo       .mojostream reader + ShapeGuard
+│   │   ├── mojostream.mojo       .mojostream reader + ShapeGuard
+│   │   └── stream_runner.mojo    True Streaming: pread, MappedLayerRef, RSS tracking
 │   ├── nlp/
 │   │   └── tokenizer.mojo        BPE tokenizer (vocab load, encode, decode)
 │   ├── bench/
@@ -85,7 +89,8 @@ MojoStream/
 │   └── gen_reference.py          NumPy reference output for validation
 │
 ├── first_light.mojo              First-token benchmark entry point
-├── bench.mojo                    P95 harness entry point
+├── bench.mojo                    P95 harness entry point (load-all + JSON)
+├── stream.mojo                   True Streaming benchmark (pread, RSS proof)
 ├── tokenizer_test.mojo           End-to-end tokenizer pipeline test
 ├── validate.mojo                 Layer-0 numerical validation entry point
 └── pixi.toml                     Build environment (Mojo 0.26, c-compiler)
@@ -186,6 +191,9 @@ cat bench_result.json
 
 # Tokenizer round-trip + forward pass demo
 pixi run mojo tokenizer_test.mojo
+
+# True Streaming: pread layer-by-layer, proves fixed RAM footprint
+pixi run mojo stream.mojo
 ```
 
 ### Run Validation
@@ -267,6 +275,7 @@ The `validate_gemma4_shape()` ShapeGuard runs automatically on every load — wr
 | 2026-05 | **P95 Benchmark Harness** — TTFT, latency distribution, I/O pressure, JSON | I/O: 2.5% |
 | 2026-05 | **BPE Tokenizer** — binary vocab, encode/decode, round-trip verified | "Hallo Mojo" ✓ |
 | 2026-05 | **Numerical Validation** — ShapeGuard + Layer-0 NumPy cross-check | **[PASS] 1.77e-6** |
+| 2026-05 | **True Streaming Mode** — pread/layer, MappedLayerRef, RSS tracking | **248 MB** peak, 0 ms I/O wait |
 
 ---
 
@@ -299,6 +308,8 @@ These are non-obvious API quirks discovered during development:
 | `with open(...) as f: var x = f.read_bytes()` | declare `x` before `with` block |
 | `exp`/`cos`/`sin` on SIMD | `from std.math import exp, cos, sin` + works natively |
 | `Dict[String, Int]` | `from std.collections import Dict` (not `std.dictionary`) |
+| `external_call["open",...]` | conflicts with Mojo's builtin `open()` → use `external_call["openat", Int32](Int32(-100), ...)` |
+| `String.unsafe_ptr()` in struct context | may yield `pointer<none>` → copy bytes to `List[UInt8]` first |
 
 ---
 
