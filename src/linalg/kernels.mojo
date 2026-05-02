@@ -487,3 +487,43 @@ fn rmsnorm_inplace(x: PtrT, n_rows: Int, n_cols: Int):
         while i < n_cols:
             rp.store[width=SIMD_W](i, rp.load[width=SIMD_W](i) * scale_v)
             i += SIMD_W
+
+
+# ===========================================================================
+# GEMMA 4 EXTENSION LAYER  –  Per-Layer Embeddings (PLE)
+#
+# Gemma 4 (April 2026) stabilisiert den Dynamikbereich der Aktivierungen
+# durch einen layer-spezifischen Skalar, der auf den Residual-Stream
+# angewendet wird. Für 4-bit-Quantisierung erhöht das die nutzbare Präzision,
+# da der Quantizer die volle INT4-Range nutzen kann.
+#
+# Ablauf im Forward-Pass:
+#   x_residual = ple_scale_inplace(x, ple_scales[layer])
+#   y = rmsnorm(x @ W_Q4)
+#   x = x + y  (residual connection)
+# ===========================================================================
+
+fn ple_scale_inplace(x: PtrT, n_rows: Int, n_cols: Int, scale: Float32):
+    """Gemma 4 Per-Layer Embedding (PLE) Skalierung.
+    Multipliziert alle Aktivierungen mit dem layer-spezifischen Skalar.
+    SIMD-vektorisiert, in-place. O(n_rows × n_cols) Operationen.
+    TODO: Erweitern auf per-head Skalierung (Gemma 4 Multi-Head PLE)."""
+    var sv    = SIMD[DT, SIMD_W](scale)
+    var total = n_rows * n_cols
+    var i     = 0
+    while i < total:
+        x.store[width=SIMD_W](i, x.load[width=SIMD_W](i) * sv)
+        i += SIMD_W
+
+
+fn swiglu_inplace(gate: PtrT, up: PtrT, n: Int):
+    """SwiGLU-Aktivierungsfunktion für Gemma 4 FFN (in-place auf up).
+    Vollständig: up[i] = up[i] * gate[i] * sigmoid(gate[i])
+    Dieser Placeholder multipliziert nur gate × up (lässt sigmoid weg).
+    TODO: Echte SiLU-Aktivierung via Polynomial-Approximation implementieren."""
+    var i = 0
+    while i < n:
+        var g = gate.load[width=SIMD_W](i)
+        var u = up.load[width=SIMD_W](i)
+        up.store[width=SIMD_W](i, u * g)   # Placeholder: kein sigmoid-Faktor
+        i += SIMD_W
