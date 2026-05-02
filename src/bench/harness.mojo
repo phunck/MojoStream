@@ -5,14 +5,15 @@
 # Metriken:
 #   TTFT           – Zeit vom ersten API-Aufruf bis zum Ende des ersten Forward-Passes
 #   P50 / P95      – Latenz-Verteilung über N_STEPS Schritte
-#   Peak-RAM       – Deterministische Schätzung aus bekannten Puffer-Größen
-#   I/O-Druck      – Anteil der Load-Zeit an der Gesamtzeit (0 % = compute-bound)
+#   Peak-RAM       – VmRSS aus /proc/self/status (echter Kernel-Wert)
+#   I/O-Druck      – max(0, IO-Zeit - Compute-Zeit) / Step-Total (echte Wartezeit)
 #
 # Output: Sauberes JSON auf stdout UND in bench_result.json.
 # Vergleich mit llama.cpp: TTFT + P95 sind die zwei Kernmetriken.
 #
 from std.time import perf_counter_ns
 from std.sys.info import num_logical_cores
+from src.streaming.stream_runner import get_rss_kb, rss_mb
 
 from src.streaming.mojostream import (
     MojoStreamFile, TensorRef,
@@ -56,10 +57,9 @@ fn estimate_peak_ram_mb(
     file_bytes: Int, n_layers: Int,
     hidden: Int, kv_dim: Int, ffn_dim: Int,
 ) -> Float64:
-    """Schätzt den Peak-RAM aus bekannten Puffergrößen (deterministisch)."""
-    # .mojostream Puffer (komplett im RAM)
+    """Schätzt den Peak-RAM aus bekannten Puffergrößen (für JSON-Output).
+    Der echte Messwert kommt von get_rss_kb() / VmRSS."""
     var raw_mb = Float64(file_bytes) / 1e6
-    # Gewichte (Gemma4LayerWeights × n_layers)
     var q_sz  = hidden * hidden   // 2
     var k_sz  = hidden * kv_dim   // 2
     var v_sz  = hidden * kv_dim   // 2
@@ -68,7 +68,6 @@ fn estimate_peak_ram_mb(
     var u_sz  = hidden * ffn_dim  // 2
     var d_sz  = ffn_dim * hidden  // 2
     var wt_mb = Float64(n_layers * (q_sz + k_sz + v_sz + o_sz + g_sz + u_sz + d_sz)) / 1e6
-    # KV-Cache (float32, K+V, alle Layer)
     var kv_mb = Float64(n_layers * KV_MAX_SEQ * kv_dim * 2 * 4) / 1e6
     return raw_mb + wt_mb + kv_mb
 
@@ -282,35 +281,42 @@ fn run_harness(path: String, workers: Int) raises:
         latencies[0]  # Näherung: Summe wäre genauer, aber wir haben nur sort-Order
     )) / 1e6
 
-    # I/O-Druck: wie viel % der Gesamt-Laufzeit war I/O?
-    var total_ms = load_ms + build_ms + p50_ms * Float64(BENCH_STEPS)
-    var io_pct   = load_ms / total_ms * 100.0
+    # I/O-Druck-Fix: echte Wartezeit = max(0, amortisiertes IO/Step - Compute/Step)
+    # amortized_io = load_ms (einmalig) verteilt auf BENCH_STEPS Schritte
+    # wait = max(0, amortized_io - best_compute) — misst tatsächliches Warten
+    var amortized_io_ms  = load_ms / Float64(BENCH_STEPS)
+    var wait_ms          = amortized_io_ms - best_ms if amortized_io_ms > best_ms else Float64(0)
+    var io_pct           = amortized_io_ms / (amortized_io_ms + best_ms) * 100.0
 
     var tps_p50  = Float64(BENCH_BATCH) / (p50_ms  / 1000.0)
     var tps_best = Float64(BENCH_BATCH) / (best_ms / 1000.0)
+
+    var rss_peak = rss_mb()   # echter VmRSS-Wert vom Kernel
 
     # ── Ergebnis-Ausgabe ─────────────────────────────────────────────────
     print()
     print("══════════════════════════════════════════════════════════════")
     print("  ERGEBNISSE")
     print("══════════════════════════════════════════════════════════════")
-    print("  Datei-Load:       ", load_ms,  "ms  (", file_mb, "MB)")
-    print("  Gewicht-Build:    ", build_ms, "ms")
-    print("  TTFT:             ", ttft_ms,  "ms")
-    print("  Latenz P50:       ", p50_ms,   "ms  →", tps_p50,  "t/s (batch=4)")
-    print("  Latenz P95:       ", p95_ms,   "ms")
-    print("  Latenz P99:       ", p99_ms,   "ms")
-    print("  Latenz Best:      ", best_ms,  "ms  →", tps_best, "t/s")
-    print("  Latenz Worst:     ", worst_ms, "ms  (seq_len wächst)")
-    print("  Peak-RAM (est.):  ", peak_ram, "MB")
-    print("  I/O-Druck:        ", io_pct,   "%  (0% = vollständig compute-bound)")
+    print("  Datei-Load:        ", load_ms,  "ms  (", file_mb, "MB)")
+    print("  Gewicht-Build:     ", build_ms, "ms")
+    print("  TTFT:              ", ttft_ms,  "ms")
+    print("  Latenz P50:        ", p50_ms,   "ms  →", tps_p50,  "t/s (batch=4)")
+    print("  Latenz P95:        ", p95_ms,   "ms")
+    print("  Latenz P99:        ", p99_ms,   "ms")
+    print("  Latenz Best:       ", best_ms,  "ms  →", tps_best, "t/s")
+    print("  Latenz Worst:      ", worst_ms, "ms  (seq_len wächst)")
+    print("  Peak RAM (VmRSS):  ", rss_peak, "MB  (Kernel-Messwert)")
+    print("  Peak RAM (est.):   ", peak_ram, "MB  (deterministisch)")
+    print("  IO-Wartezeit/Step: ", wait_ms,  "ms  (amortisiert, max(0, IO-Compute))")
+    print("  I/O-Druck:         ", io_pct,   "%  (amortisiertes IO vs Compute)")
     print("══════════════════════════════════════════════════════════════")
 
     var json = build_json(
         path, ms.meta.n_layers, ms.meta.hidden, ms.meta.kv_dim, ms.meta.ffn_dim,
         file_mb, load_ms, build_ms, ttft_ms,
         p50_ms, p95_ms, p99_ms, best_ms, worst_ms,
-        peak_ram, BENCH_STEPS, BENCH_BATCH, io_pct,
+        rss_peak, BENCH_STEPS, BENCH_BATCH, io_pct,
         tps_p50, tps_best,
     )
 

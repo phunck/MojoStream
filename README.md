@@ -1,13 +1,13 @@
 # MojoStream
 
-> **MojoStream: High-performance LLM inference engine written in Mojo. Stream 14B+ models on consumer hardware with <500MB RAM usage. Optimized for Gemma 4 (PLE/GQA) and zero-latency SATA/NVMe streaming.**
+> **MojoStream: High-performance LLM inference engine written in Mojo. Optimized for Layer-by-Layer Streaming — run 14B+ models on consumer hardware without loading the full model into RAM. Built for Gemma 4 (PLE/GQA) and zero-latency SATA/NVMe throughput.**
 
 ---
 
 ## Project Status
 
 ```
-Branch: master  |  Mojo: 0.26.2  |  Target: x86-64 AVX2  |  License: MIT
+Branch: main  |  Mojo: 0.26.2  |  Target: x86-64 AVX2  |  License: Apache 2.0
 ```
 
 | Component | Status | Last Verified |
@@ -338,7 +338,7 @@ python3 scripts/gen_reference.py
 pixi run mojo validate.mojo      # must be [PASS]
 pixi run mojo tokenizer_test.mojo
 
-# Submit PR to master
+# Submit PR to main
 ```
 
 **PR checklist:**
@@ -362,6 +362,10 @@ For 14B real-weight inference (D=4096, 46 layers):
 estimated **~0.8 t/s** on the dev machine (SATA, single token decode).
 
 ---
+
+## Tokenizer Note
+
+> The current tokenizer is an ASCII/BPE prototype for pipeline validation. A full UTF-8/SentencePiece implementation is on the roadmap.
 
 ## License
 
