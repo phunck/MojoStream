@@ -5,8 +5,10 @@ __pycache__/
 .ipynb_checkpoints/
 outputs/
 
-# Kompiliertes Mojo-Binary
+# Kompilierte Mojo-Binaries
 matrix_bench
+mojo_inference
+test_import
 
 # Claude-interne Dateien
 .claude/
