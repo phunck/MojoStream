@@ -185,3 +185,77 @@ fn matmul_q4_bpack(C: Matrix, A: Matrix, Bq: Q4Matrix, workers: Int = 0):
 
     var w = workers if workers > 0 else num_logical_cores()
     parallelize[process_m_block](num_m_blocks, w)
+
+
+# ---------------------------------------------------------------------------
+# matmul_q4_bpack_raw – gleicher Kernel, nimmt rohe Pointer statt Q4Matrix.
+# Für Streaming-Kontexte, wo zwei Buffer abwechselnd genutzt werden und
+# Q4Matrix-Ownership zwischen parallelen Tasks problematisch wäre.
+# ---------------------------------------------------------------------------
+fn matmul_q4_bpack_raw(
+    C: Matrix,
+    A: Matrix,
+    bq_ptr:      U8Ptr,   # gepackte uint8 Gewichte
+    packed_cols: Int,      # = N // 2
+    scale:       Float32,
+    workers:     Int = 0,
+):
+    var N_log = packed_cols * 2
+    var Acols = A.cols
+    var sv    = SIMD[DT, HALF_W](scale)
+    var num_m_blocks = (C.rows + BM - 1) // BM
+    var bptr  = bq_ptr
+
+    @parameter
+    fn process_m_block(mb: Int):
+        var m0 = mb * BM
+        var m1 = min(m0 + BM, C.rows)
+        var aptr = A.data()
+
+        var b_buf = List[Scalar[DT]]()
+        b_buf.resize(BK * NR, 0)
+        var bp = rebind[PtrT](b_buf.unsafe_ptr())
+
+        for kt in range(0, Acols, BK):
+            var k1 = min(kt + BK, Acols)
+            var bk = k1 - kt
+            var nt = 0
+            while nt < N_log:
+                var byte0 = nt // 2
+                var byte1 = byte0 + HALF_W
+                for k_local in range(bk):
+                    var row   = (kt + k_local) * packed_cols
+                    var b_off = k_local * NR
+                    bp.store[width=SIMD_W](b_off,          dequant_vec(bptr, row + byte0, sv))
+                    bp.store[width=SIMD_W](b_off + SIMD_W, dequant_vec(bptr, row + byte1, sv))
+                var m = m0
+                while m < m1:
+                    var acc00 = SIMD[DT, SIMD_W](0); var acc01 = SIMD[DT, SIMD_W](0)
+                    var acc10 = SIMD[DT, SIMD_W](0); var acc11 = SIMD[DT, SIMD_W](0)
+                    var acc20 = SIMD[DT, SIMD_W](0); var acc21 = SIMD[DT, SIMD_W](0)
+                    var acc30 = SIMD[DT, SIMD_W](0); var acc31 = SIMD[DT, SIMD_W](0)
+                    for k_local in range(bk):
+                        var b_off = k_local * NR
+                        var B0 = bp.load[width=SIMD_W](b_off)
+                        var B1 = bp.load[width=SIMD_W](b_off + SIMD_W)
+                        var base = m * Acols + kt + k_local
+                        var a0 = aptr.load(base);              var a1 = aptr.load(base + Acols)
+                        var a2 = aptr.load(base + 2 * Acols);  var a3 = aptr.load(base + 3 * Acols)
+                        acc00 = acc00 + a0 * B0;  acc01 = acc01 + a0 * B1
+                        acc10 = acc10 + a1 * B0;  acc11 = acc11 + a1 * B1
+                        acc20 = acc20 + a2 * B0;  acc21 = acc21 + a2 * B1
+                        acc30 = acc30 + a3 * B0;  acc31 = acc31 + a3 * B1
+                    var n1 = nt + SIMD_W
+                    C.store[SIMD_W](m,   nt, C.load[SIMD_W](m,   nt) + acc00)
+                    C.store[SIMD_W](m,   n1, C.load[SIMD_W](m,   n1) + acc01)
+                    C.store[SIMD_W](m+1, nt, C.load[SIMD_W](m+1, nt) + acc10)
+                    C.store[SIMD_W](m+1, n1, C.load[SIMD_W](m+1, n1) + acc11)
+                    C.store[SIMD_W](m+2, nt, C.load[SIMD_W](m+2, nt) + acc20)
+                    C.store[SIMD_W](m+2, n1, C.load[SIMD_W](m+2, n1) + acc21)
+                    C.store[SIMD_W](m+3, nt, C.load[SIMD_W](m+3, nt) + acc30)
+                    C.store[SIMD_W](m+3, n1, C.load[SIMD_W](m+3, n1) + acc31)
+                    m += MR
+                nt += NR
+
+    var w = workers if workers > 0 else num_logical_cores()
+    parallelize[process_m_block](num_m_blocks, w)
