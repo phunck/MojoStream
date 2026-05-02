@@ -1,147 +1,212 @@
-# src/main.mojo
-# Inferenz-Simulation: 40 Layer × 4096×4096 Q4-Matmul mit Layer-Streaming.
+# src/main.mojo – Q4 Inference Benchmark (Tokens/Sekunde)
 #
-# Was wir messen:
-#   - t_load[i]     : Zeit zum Laden von layer_i.bin von Disk
-#   - t_compute[i]  : Zeit für matmul_q4_bpack_raw (B-Pack Kernel)
-#   - wait_time[i]  : max(0, t_load[i+1] - t_compute[i])
-#                     = Idle-Zeit, in der die CPU auf die SSD wartet
+# Simuliert einen vereinfachten LLM-Forward-Pass:
+#   for layer in 0..N_LAYERS:
+#     x = rmsnorm(x @ W_Q4)   # linear projection + normalisierung
 #
-# Bei Q4 B-Pack ≥ 128 GFLOPS und ~8 MB/Layer → t_compute >> t_load →
-# wait_time ≈ 0 → Das System ist durchsatzlimitiert, nicht I/O-limitiert.
+# Zwei Benchmarks:
+#   (A) COMPUTE-only: Gewichte pre-loaded in RAM (eliminiert I/O)
+#   (B) STREAMING:    Gewichte Layer-für-Layer von SSD geladen
+#
+# Batch-Größe = MR = 4 (prozessiert 4 Token gleichzeitig; MR-aligned → kein Tail)
 from std.time import perf_counter_ns
 from std.sys.info import num_logical_cores
+from std.memory import UnsafePointer
 
-from src.linalg.kernels import Matrix, Q4Matrix, matmul_q4_bpack, matmul_q4_bpack_l2
-from src.streaming.loader import ModelRunner, LayerStats
+from src.linalg.kernels import (
+    Matrix, U8Ptr, PtrT, DT, SIMD_W,
+    matmul_q4_prepacked, matmul_q4_bpack,
+    rmsnorm_inplace, num_logical_cores,
+)
 
-# ── Konfiguration ───────────────────────────────────────────────────────────
-alias N_DIM       = 4096   # Gewichtsmatrix-Dimension (4096 = LLM-typisch)
-alias N_LAYERS    = 40     # Anzahl Layer
-alias MODEL_PATH  = "model_weights"
-# ---------------------------------------------------------------------------
+# ── Konfiguration ────────────────────────────────────────────────────────────
+alias D          = 4096   # Modell-Dimension (hidden size)
+alias N_LAYERS   = 40     # Anzahl Layer
+alias BATCH      = 4      # Token-Batch (MR=4, kein Tail-Handling nötig)
+alias N_STEPS    = 3      # Benchmark-Wiederholungen für stabile Messung
+alias PACKED_DIR = "model_weights_packed"
+alias ROW_DIR    = "model_weights"
+# ─────────────────────────────────────────────────────────────────────────────
+
+alias PACKED_SIZE = D * (D // 2)   # Bytes pro Layer (= 8.388.608 für D=4096)
 
 
-fn print_stats(stats: List[LayerStats], ncores: Int) -> None:
-    var total_compute_ms = Float64(0)
-    var total_load_ms    = Float64(0)
-    var total_wait_ms    = Float64(0)
-    var max_load_ms      = Float64(0)
-    var max_compute_ms   = Float64(0)
+# ── Gewicht-Loader: liest eine Layer-Datei (beide Formate) ───────────────────
+fn load_weight(dst: U8Ptr, packed_size: Int, path: String) raises -> Float32:
+    var sc: Float32 = 0.0
+    with open(path, "r") as f:
+        var raw  = f.read_bytes()
+        var rptr = raw.unsafe_ptr()
+        sc = rptr.bitcast[Float32]().load(0)
+        var src = rptr + 4
+        for i in range(packed_size):
+            dst.store(i, src.load(i))
+    return sc
 
+
+# ── Kernstück: ein Forward-Schritt durch alle Layer ──────────────────────────
+fn forward_step(
+    mut x:     Matrix,              # (BATCH, D) Aktivierungen, in-place-Update
+    mut tmp:   Matrix,              # (BATCH, D) Arbeits-Buffer
+    weights:   List[List[UInt8]],   # pre-loaded: weights[layer][raw bytes]
+    scales:    List[Float32],
+    workers:   Int,
+):
+    for layer in range(N_LAYERS):
+        var src = rebind[U8Ptr](weights[layer].unsafe_ptr())
+        tmp.zero()
+        matmul_q4_prepacked(tmp, x, src, scales[layer], D, D, workers)
+        rmsnorm_inplace(tmp.data(), BATCH, D)
+
+        # Aktivierungen für nächsten Layer übernehmen (pointer-freier Swap via Copy)
+        var xd = x.data()
+        var td = tmp.data()
+        for i in range(BATCH * D):
+            xd.store(i, td.load(i))
+
+
+# ── Compute-Only Benchmark: alles in RAM ──────────────────────────────────────
+fn bench_compute_only(workers: Int) raises:
+    print("═══════════════════════════════════════════════════════")
+    print("  (A) COMPUTE-ONLY BENCHMARK (Gewichte in RAM)")
+    print("═══════════════════════════════════════════════════════")
+    print("Lade", N_LAYERS, "Layer à", PACKED_SIZE / 1e6, "MB in RAM ...")
+
+    var weights = List[List[UInt8]]()
+    var scales  = List[Float32]()
+
+    for i in range(N_LAYERS):
+        var buf = List[UInt8]()
+        buf.resize(PACKED_SIZE, 0)
+        var path  = PACKED_DIR + "/layer_" + String(i) + ".bin"
+        var sc    = load_weight(rebind[U8Ptr](buf.unsafe_ptr()), PACKED_SIZE, path)
+        weights.append(buf^)
+        scales.append(sc)
+
+    print("RAM belegt: ca.", Float64(N_LAYERS * PACKED_SIZE) / 1e6, "MB")
+    print("Starte Benchmark (", N_STEPS, "Schritte, batch=", BATCH, ") ...")
+
+    var x   = Matrix(BATCH, D);  x.fill_random()
+    var tmp = Matrix(BATCH, D)
+
+    # Warm-up
+    forward_step(x, tmp, weights, scales, workers)
+
+    var best: UInt = UInt.MAX
+    for _ in range(N_STEPS):
+        x.fill_random()
+        var t0 = perf_counter_ns()
+        forward_step(x, tmp, weights, scales, workers)
+        var dt = perf_counter_ns() - t0
+        if dt < best: best = dt
+
+    var ms_step   = Float64(Int(best)) / 1e6
+    var tps_batch = Float64(BATCH) / (Float64(Int(best)) / 1e9)
+    var tps_single = 1.0 / (Float64(Int(best)) / 1e9)
     print()
-    print("Layer | Load [ms] | Compute [ms] | Wait [ms] | Overlap?")
-    print("------+-----------+--------------+-----------+---------")
+    print("Compute-Zeit pro Step:  ", ms_step, "ms")
+    print("Tokens/Sek (batch=4):   ", tps_batch, "t/s")
+    print("Tokens/Sek (batch=1 eff):", tps_single, "t/s")
 
-    for i in range(len(stats)):
-        var s   = stats[i].copy()
-        var lms = Float64(Int(s.load_ns))    / 1e6
-        var cms = Float64(Int(s.compute_ns)) / 1e6
-        var wms = Float64(Int(s.wait_ns))    / 1e6
-        var overlap = "YES" if s.wait_ns == 0 else "NO "
-        print(i, "  |", lms, "  |", cms, "  |", wms, "  |", overlap)
-        total_load_ms    += lms
-        total_compute_ms += cms
-        total_wait_ms    += wms
-        if lms > max_load_ms:    max_load_ms    = lms
-        if cms > max_compute_ms: max_compute_ms = cms
 
-    var n       = Float64(len(stats))
-    var flops_l = 2.0 * Float64(N_DIM) * Float64(N_DIM) * Float64(N_DIM)
-    var gflops  = flops_l / (total_compute_ms / 1e3 / n) / 1e9
+# ── Streaming Benchmark: Layer-für-Layer von SSD ─────────────────────────────
+fn bench_streaming(workers: Int) raises:
+    print()
+    print("═══════════════════════════════════════════════════════")
+    print("  (B) STREAMING BENCHMARK (Layer-für-Layer von SSD)")
+    print("═══════════════════════════════════════════════════════")
 
+    var x   = Matrix(BATCH, D);  x.fill_random()
+    var tmp = Matrix(BATCH, D)
+
+    var layer_buf = List[UInt8]()
+    layer_buf.resize(PACKED_SIZE, 0)
+    var lptr = rebind[U8Ptr](layer_buf.unsafe_ptr())
+
+    var best: UInt = UInt.MAX
+
+    # Warm-up: 1 vollständiger Durchlauf
+    for layer in range(N_LAYERS):
+        var path  = PACKED_DIR + "/layer_" + String(layer) + ".bin"
+        var scale = load_weight(lptr, PACKED_SIZE, path)
+        tmp.zero()
+        matmul_q4_prepacked(tmp, x, lptr, scale, D, D, workers)
+        rmsnorm_inplace(tmp.data(), BATCH, D)
+        var xd = x.data(); var td = tmp.data()
+        for i in range(BATCH * D): xd.store(i, td.load(i))
+
+    for _ in range(N_STEPS):
+        x.fill_random()
+        var t0 = perf_counter_ns()
+        for layer in range(N_LAYERS):
+            var path  = PACKED_DIR + "/layer_" + String(layer) + ".bin"
+            var scale = load_weight(lptr, PACKED_SIZE, path)
+            tmp.zero()
+            matmul_q4_prepacked(tmp, x, lptr, scale, D, D, workers)
+            rmsnorm_inplace(tmp.data(), BATCH, D)
+            var xd = x.data(); var td = tmp.data()
+            for i in range(BATCH * D): xd.store(i, td.load(i))
+        var dt = perf_counter_ns() - t0
+        if dt < best: best = dt
+
+    var ms_step = Float64(Int(best)) / 1e6
+    var io_mb   = Float64(N_LAYERS * PACKED_SIZE) / 1e6
+    var io_gbs  = io_mb / ms_step
+
+    print("Streaming-Zeit pro Step:    ", ms_step, "ms")
+    print("  davon I/O (", io_mb, "MB):  ca.", io_mb / io_gbs, "ms (~", io_gbs, "GB/s)")
+    print("Tokens/Sek (batch=4):        ", Float64(BATCH) / (Float64(Int(best)) / 1e9), "t/s")
+    print("Tokens/Sek (batch=1 eff):    ", 1.0 / (Float64(Int(best)) / 1e9), "t/s")
+
+
+# ── Kernel-Scaling-Vergleich ─────────────────────────────────────────────────
+fn bench_scaling(workers: Int) raises:
+    from src.linalg.kernels import Q4Matrix
+    from std.random import rand as rand_u8
     print()
-    print("══════════════════════════════════════════════════════════")
-    print("ZUSAMMENFASSUNG  (", N_LAYERS, " Layer × ", N_DIM, "×", N_DIM, " Q4)")
-    print("══════════════════════════════════════════════════════════")
-    print("Threads (Compute):     ", ncores)
-    print("Ø Ladezeit/Layer:      ", total_load_ms    / n, "ms")
-    print("Ø Rechenzeit/Layer:    ", total_compute_ms / n, "ms")
-    print("Ø Wait-Zeit/Layer:     ", total_wait_ms    / n, "ms")
-    print("Totale Wait-Zeit:      ", total_wait_ms, "ms")
-    print("Effektive GFLOPS:      ", gflops)
-    print()
-    # Sequenziell vs. Overlapped
-    var seq_ms      = total_load_ms + total_compute_ms
-    var overlap_ms  = total_compute_ms + max_load_ms  # erster Load blockiert
-    print("Wallclock sequenziell: ", seq_ms, "ms")
-    print("Wallclock overlapped:  ", overlap_ms, "ms  (erster Load unberlappbar)")
-    print("Streaming-Speedup:     ", seq_ms / overlap_ms, "x")
-    print()
-    if total_wait_ms < 10.0:
-        print("✓ I/O hält den Kernel SATT  – Memory-Wall überwunden!")
-        print("  Dein System kann Modelle jeder Größe flüssig streamen,")
-        print("  solange sie auf die SSD passen.")
-    else:
-        print("⚠ SSD ist langsamer als der Kernel. Upgrade auf NVMe empfohlen.")
+    print("═══════════════════════════════════════════════════════")
+    print("  KERNEL SCALING  (BPack vs. Pre-Packed, N=1024/4096)")
+    print("═══════════════════════════════════════════════════════")
+
+    for pass_n in range(2):
+        var nb      = 1024 if pass_n == 0 else 4096
+        var flops_b = 2.0 * Float64(nb) * Float64(nb) * Float64(nb)
+        var Ab  = Matrix(nb, nb);  Ab.fill_random()
+        var Cb  = Matrix(nb, nb)
+        var Q4  = Q4Matrix(nb, nb, Float32(0.1));  Q4.fill_random()
+
+        matmul_q4_bpack(Cb, Ab, Q4, workers)   # warm-up
+        var best1: UInt = UInt.MAX
+        for _ in range(3):
+            Cb.zero(); var t0 = perf_counter_ns()
+            matmul_q4_bpack(Cb, Ab, Q4, workers)
+            var dt = perf_counter_ns() - t0
+            if dt < best1: best1 = dt
+
+        var prepack_buf = List[UInt8](); prepack_buf.resize(nb * (nb // 2), 0)
+        var pp_ptr = rebind[U8Ptr](prepack_buf.unsafe_ptr())
+        rand_u8[DType.uint8](pp_ptr, nb * (nb // 2))
+
+        matmul_q4_prepacked(Cb, Ab, pp_ptr, Float32(0.1), nb, nb, workers)
+        var best2: UInt = UInt.MAX
+        for _ in range(3):
+            Cb.zero(); var t0 = perf_counter_ns()
+            matmul_q4_prepacked(Cb, Ab, pp_ptr, Float32(0.1), nb, nb, workers)
+            var dt = perf_counter_ns() - t0
+            if dt < best2: best2 = dt
+
+        var ms1 = Float64(Int(best1)) / 1e6; var gf1 = flops_b / (Float64(Int(best1)) / 1e9) / 1e9
+        var ms2 = Float64(Int(best2)) / 1e6; var gf2 = flops_b / (Float64(Int(best2)) / 1e9) / 1e9
+        print("N=", nb, "  BPack:", ms1, "ms /", gf1,
+              "GFLOPS  |  Pre-Packed:", ms2, "ms /", gf2, "GFLOPS")
 
 
 fn main() raises:
     var ncores = num_logical_cores()
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Direkt-Vergleich: BPack vs. L2-BPack für N=1024 und N=4096
-    # ──────────────────────────────────────────────────────────────────────
     print("══════════════════════════════════════════════════════════")
-    print("  KERNEL SCALING BENCHMARK")
+    print("  LLM Inference Benchmark  (D=", D, " Layers=", N_LAYERS, " Threads=", ncores, ")")
     print("══════════════════════════════════════════════════════════")
-    # ── N=1024 ──────────────────────────────────────────────────────────────
-    for pass_n in range(2):
-        var nb    = 1024 if pass_n == 0 else 4096
-        var flops_b = 2.0 * Float64(nb) * Float64(nb) * Float64(nb)
-        var Ab  = Matrix(nb, nb);               Ab.fill_random()
-        var Bqb = Q4Matrix(nb, nb, Float32(0.1)); Bqb.fill_random()
-        var Cb  = Matrix(nb, nb)
 
-        matmul_q4_bpack(Cb, Ab, Bqb, ncores)  # warm-up
-        var best1: UInt = UInt.MAX
-        for _ in range(3):
-            Cb.zero()
-            var t0 = perf_counter_ns()
-            matmul_q4_bpack(Cb, Ab, Bqb, ncores)
-            var dt = perf_counter_ns() - t0
-            if dt < best1: best1 = dt
-        var ms1 = Float64(Int(best1)) / 1e6
-        var gf1 = flops_b / (Float64(Int(best1)) / 1e9) / 1e9
-
-        matmul_q4_bpack_l2(Cb, Ab, Bqb, ncores)  # warm-up
-        var best2: UInt = UInt.MAX
-        for _ in range(3):
-            Cb.zero()
-            var t0 = perf_counter_ns()
-            matmul_q4_bpack_l2(Cb, Ab, Bqb, ncores)
-            var dt = perf_counter_ns() - t0
-            if dt < best2: best2 = dt
-        var ms2 = Float64(Int(best2)) / 1e6
-        var gf2 = flops_b / (Float64(Int(best2)) / 1e9) / 1e9
-
-        print("N=", nb, "  BPack:", ms1, "ms /", gf1,
-              "GFLOPS  |  L2-BPack:", ms2, "ms /", gf2, "GFLOPS")
-
-    print()
-    print("══════════════════════════════════════════════════════════")
-    print("  Q4-Layer-Streaming Inference Simulation")
-    print("══════════════════════════════════════════════════════════")
-    print("N_DIM=", N_DIM, "  N_LAYERS=", N_LAYERS, "  Threads=", ncores)
-    print("Modell-Pfad:", MODEL_PATH)
-    print()
-
-    # Aktivierungs-Matrix (synthetisch, bleibt über alle Layer konstant)
-    print("Allokiere Aktivierungen A (", N_DIM, "×", N_DIM, "fp32 =",
-          N_DIM * N_DIM * 4 / 1e6, "MB) ...")
-    var A = Matrix(N_DIM, N_DIM)
-    A.fill_random()
-
-    # Ausgabe-Matrix (wird nach jedem Layer genullt)
-    var C = Matrix(N_DIM, N_DIM)
-
-    # ModelRunner initialisieren
-    var runner = ModelRunner(MODEL_PATH, N_LAYERS, N_DIM, ncores)
-
-    print("Starte Pipeline ...")
-    var t_wall0 = perf_counter_ns()
-    var stats   = runner.run_pipeline(C, A)
-    var t_wall  = Float64(Int(perf_counter_ns() - t_wall0)) / 1e6
-
-    print("Wall-Clock gesamt:", t_wall, "ms")
-    print_stats(stats, ncores)
+    bench_scaling(ncores)
+    bench_compute_only(ncores)
+    bench_streaming(ncores)

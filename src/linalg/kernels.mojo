@@ -5,6 +5,7 @@ from std.algorithm.functional import parallelize
 from std.memory import UnsafePointer, memset_zero
 from std.sys.info import simd_width_of, num_logical_cores
 from std.random import rand
+from std.math import sqrt
 
 # ---------------------------------------------------------------------------
 # Compile-Zeit Konstanten
@@ -373,3 +374,116 @@ fn matmul_q4_bpack_l2(C: Matrix, A: Matrix, Bq: Q4Matrix, workers: Int = 0):
 
     var w = workers if workers > 0 else num_logical_cores()
     parallelize[process_mc](n_mc, w)
+
+
+# ---------------------------------------------------------------------------
+# matmul_q4_prepacked – kein Stride-Zugriff auf B
+#
+# Erwartet B im Pre-Tiled Layout (erzeugt von create_fake_model.py --pre-packed):
+#   tile_base = (kt_idx * n_nt + nt_idx) * BK * (NR//2)
+#   kl_bytes  = tile_base + k_local * (NR//2)
+# Alle Lade-Ops sind sequenziell → Hardware-Prefetcher maximal effizient.
+#
+# KEIN on-the-fly Stride-Packing mehr (kein `k * pcols + byte_off`).
+# ---------------------------------------------------------------------------
+
+alias TILE_BYTES = NR // 2  # 8 Bytes pro (k_local, nt_tile) → 2 × HALF_W Reads
+
+
+fn matmul_q4_prepacked(
+    C:       Matrix,
+    A:       Matrix,
+    bq_ptr:  U8Ptr,    # pre-tiled uint8 Gewichte
+    scale:   Float32,
+    K:       Int,      # Gewichts-Dimensionen
+    N_out:   Int,
+    workers: Int = 0,
+):
+    var M      = C.rows
+    var sv     = SIMD[DT, HALF_W](scale)
+    var n_kt   = K    // BK
+    var n_nt   = N_out // NR
+    var t_size = BK * TILE_BYTES  # 1024 Bytes pro (kt, nt)-Tile
+    var num_mb = (M + BM - 1) // BM
+
+    @parameter
+    fn process_mb(mb: Int):
+        var m0    = mb * BM
+        var m1    = min(m0 + BM, M)
+        var aptr  = A.data()
+        var Acols = A.cols
+
+        var b_buf = List[Scalar[DT]]()
+        b_buf.resize(BK * NR, 0)
+        var bp = rebind[PtrT](b_buf.unsafe_ptr())
+
+        for kt_idx in range(n_kt):
+            var kt = kt_idx * BK
+
+            for nt_idx in range(n_nt):
+                var nt        = nt_idx * NR
+                var tile_base = (kt_idx * n_nt + nt_idx) * t_size
+
+                # Pre-Dequant: sequenziell aus Tile (kein Stride!)
+                for kl in range(BK):
+                    var kl_off = tile_base + kl * TILE_BYTES
+                    var boff   = kl * NR
+                    bp.store[width=SIMD_W](boff,        dequant_vec(bq_ptr, kl_off,         sv))
+                    bp.store[width=SIMD_W](boff+SIMD_W, dequant_vec(bq_ptr, kl_off+HALF_W,  sv))
+
+                # MR=4 Mikro-Kernel (FMA aus L1-Puffer, identisch zu matmul_q4_bpack)
+                var m = m0
+                while m < m1:
+                    var acc00 = SIMD[DT, SIMD_W](0); var acc01 = SIMD[DT, SIMD_W](0)
+                    var acc10 = SIMD[DT, SIMD_W](0); var acc11 = SIMD[DT, SIMD_W](0)
+                    var acc20 = SIMD[DT, SIMD_W](0); var acc21 = SIMD[DT, SIMD_W](0)
+                    var acc30 = SIMD[DT, SIMD_W](0); var acc31 = SIMD[DT, SIMD_W](0)
+
+                    for kl in range(BK):
+                        var boff = kl * NR
+                        var B0   = bp.load[width=SIMD_W](boff)
+                        var B1   = bp.load[width=SIMD_W](boff + SIMD_W)
+                        var base = m * Acols + kt + kl
+                        var a0 = aptr.load(base);             var a1 = aptr.load(base + Acols)
+                        var a2 = aptr.load(base + 2 * Acols); var a3 = aptr.load(base + 3 * Acols)
+                        acc00 = acc00 + a0 * B0;  acc01 = acc01 + a0 * B1
+                        acc10 = acc10 + a1 * B0;  acc11 = acc11 + a1 * B1
+                        acc20 = acc20 + a2 * B0;  acc21 = acc21 + a2 * B1
+                        acc30 = acc30 + a3 * B0;  acc31 = acc31 + a3 * B1
+
+                    var n1 = nt + SIMD_W
+                    C.store[SIMD_W](m,   nt, C.load[SIMD_W](m,   nt) + acc00)
+                    C.store[SIMD_W](m,   n1, C.load[SIMD_W](m,   n1) + acc01)
+                    C.store[SIMD_W](m+1, nt, C.load[SIMD_W](m+1, nt) + acc10)
+                    C.store[SIMD_W](m+1, n1, C.load[SIMD_W](m+1, n1) + acc11)
+                    C.store[SIMD_W](m+2, nt, C.load[SIMD_W](m+2, nt) + acc20)
+                    C.store[SIMD_W](m+2, n1, C.load[SIMD_W](m+2, n1) + acc21)
+                    C.store[SIMD_W](m+3, nt, C.load[SIMD_W](m+3, nt) + acc30)
+                    C.store[SIMD_W](m+3, n1, C.load[SIMD_W](m+3, n1) + acc31)
+                    m += MR
+
+    var w = workers if workers > 0 else num_logical_cores()
+    parallelize[process_mb](num_mb, w)
+
+
+# ---------------------------------------------------------------------------
+# rmsnorm_inplace – SIMD-optimierte Row-wise RMSNorm (in-place)
+# Jede Zeile x wird normalisiert: x /= rms(x)
+# ---------------------------------------------------------------------------
+
+fn rmsnorm_inplace(x: PtrT, n_rows: Int, n_cols: Int):
+    for row in range(n_rows):
+        var rp = x + row * n_cols
+        # Summe der Quadrate via SIMD-Reduktion
+        var sq = SIMD[DT, SIMD_W](0)
+        var i  = 0
+        while i < n_cols:
+            var v = rp.load[width=SIMD_W](i)
+            sq += v * v
+            i  += SIMD_W
+        var rms_inv = Float32(1.0) / sqrt(sq.reduce_add() / Float32(n_cols) + Float32(1e-6))
+        var scale_v = SIMD[DT, SIMD_W](rms_inv)
+        i = 0
+        while i < n_cols:
+            rp.store[width=SIMD_W](i, rp.load[width=SIMD_W](i) * scale_v)
+            i += SIMD_W
