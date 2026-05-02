@@ -1,0 +1,25 @@
+{
+  "format": "mojostream",
+  "source": "model.mojostream",
+  "model": {
+    "n_layers": 40,
+    "hidden": 1024,
+    "kv_dim": 256,
+    "ffn_dim": 2048
+  },
+  "file_mb": 178.270208,
+  "load_time_ms": 543.581234,
+  "build_time_ms": 188.345085,
+  "ttft_ms": 956.047418,
+  "latency_p50_ms": 206.498215,
+  "latency_p95_ms": 241.324379,
+  "latency_p99_ms": 257.223765,
+  "latency_best_ms": 175.372118,
+  "latency_worst_ms": 260.598127,
+  "peak_ram_mb": 398.47116800000003,
+  "io_pressure_pct": 2.5422675386572893,
+  "n_steps": 100,
+  "batch": 4,
+  "tokens_per_sec_p50": 19.370627489443432,
+  "tokens_per_sec_best": 22.808642819721207
+}
