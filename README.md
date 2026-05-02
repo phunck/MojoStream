@@ -365,8 +365,10 @@ estimated **~0.8 t/s** on the dev machine (SATA, single token decode).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+Copyright 2026 Paul Hunck
 
 ---
 
-*MojoStream — phunck, 2026.*
+*MojoStream — Paul Hunck, 2026.*
