@@ -19,7 +19,7 @@ from std.math import sqrt
 from src.streaming.mojostream import (
     MojoStreamFile, MojoStreamMeta, TensorEntry,
     MS_Q, MS_K, MS_V, MS_O, MS_GATE, MS_UP, MS_DOWN,
-    TENSORS_PER_LAYER,
+    TENSORS_PER_LAYER, HDR_BYTES, DIR_E_BYTES,
 )
 from src.main import (
     Gemma4Config, KVCache,
@@ -161,22 +161,31 @@ fn gemma4_forward_stream(
     for j in range(batch * D): xd.store(j, xd.load(j) + fd.load(j))
 
 
-# ── StreamingRunner — pread-basierter Layer-Loader ──────────────────────────
+# ── StreamingRunner — Strict Metadata Guard + pread Layer-Loader ────────────
 
 struct StreamingRunner(Movable):
     """
     Lädt Layer-Gewichte via pread() direkt aus der .mojostream-Datei.
     Hält immer nur einen Layer im Scratch-Buffer — kein load-all.
 
-    RAM-Profil (D=1024):  ~4.3 MB Gewicht-Buffer
-    RAM-Profil (D=4096):  ~68 MB Gewicht-Buffer
+    Initialisierung als strikte Invarianten-Sequenz (Fail-Fast):
+      Step 1  openat()               → fd  (Datei muss existieren)
+      Step 2  lseek(SEEK_END)        → file_size
+      Step 3  pread(128 B)           → Header parsen
+      Step 4  _check_shape()         → Gemma-4-Architektur-Invarianten
+      Step 5  pread(n_tensors × 32)  → Tensor-Directory parsen
+      Step 6  validate_tensor_entries() → Dimensionen, Alignment, Bounds, Scale
+      Step 7  _init_offsets()        → Scratch-Buffer allozieren (nur nach Erfolg)
+
+    Kein Raw-Pointer-Zugriff findet statt bevor alle Checks bestanden sind.
+    RAM-Profil (D=1024): ~4.4 MB  |  (D=4096): ~68 MB
     """
-    var fd:          Int32             # offener Datei-Deskriptor
+    var fd:          Int32
     var meta:        MojoStreamMeta
     var entries:     List[TensorEntry]
-    var scratch:     List[UInt8]       # ein Layer Platz
-    var mat_offsets: List[Int]         # Byte-Offsets pro Matrix im Scratch-Buffer
-    var mat_sizes:   List[Int]         # Byte-Größen
+    var scratch:     List[UInt8]
+    var mat_offsets: List[Int]
+    var mat_sizes:   List[Int]
 
     fn __init__(out self, path: String) raises:
         self.meta        = MojoStreamMeta()
@@ -184,38 +193,204 @@ struct StreamingRunner(Movable):
         self.scratch     = List[UInt8]()
         self.mat_offsets = List[Int]()
         self.mat_sizes   = List[Int]()
+        self.fd          = Int32(-1)
 
-        # Datei öffnen (O_RDONLY = 0)
-        # String.unsafe_ptr() ergibt in Struct-Kontext pointer<none> → List[UInt8]-Workaround
-        var n_path = len(path)
-        var path_buf = List[UInt8](capacity=n_path + 1)
+        # ── Step 1: Datei öffnen ─────────────────────────────────────────────
+        # String.unsafe_ptr() → pointer<none> in Struct-Kontext: List[UInt8]-Workaround
+        var path_buf = List[UInt8](capacity=len(path) + 1)
         var path_ptr = path.unsafe_ptr()
-        for i in range(n_path):
+        for i in range(len(path)):
             path_buf.append(path_ptr.load(i))
-        path_buf.append(UInt8(0))  # null-terminate für C-API
+        path_buf.append(UInt8(0))
 
         # openat(AT_FDCWD=-100, path, O_RDONLY=0) — vermeidet Konflikt mit Mojos open()
         self.fd = external_call["openat", Int32](
             Int32(-100), path_buf.unsafe_ptr(), Int32(0)
         )
         if self.fd < 0:
-            raise Error("StreamingRunner: Datei nicht gefunden: " + path)
+            raise Error("[StreamingRunner] Datei nicht gefunden: " + path)
 
-        # Header + Verzeichnis über MojoStreamFile einlesen (read_bytes von Anfang)
-        var ms = MojoStreamFile(path)
-        self.meta    = ms.meta.copy()
-        self.entries = ms.entries.copy()
+        # ── Step 2: Dateigröße ermitteln ─────────────────────────────────────
+        # SEEK_END = 2; pread ändert den Datei-Offset nicht → lseek nur für stat
+        var file_size = Int(external_call["lseek", Int64](self.fd, Int64(0), Int32(2)))
+        if file_size <= Int(HDR_BYTES):
+            raise Error("[StreamingRunner] Datei zu klein: " + String(file_size) + " Bytes")
 
-        # Scratch-Buffer dimensionieren (1 Layer)
+        # ── Step 3: Header lesen und parsen (128 Byte) ───────────────────────
+        var hdr_buf = List[UInt8]()
+        hdr_buf.resize(HDR_BYTES, 0)
+        var n_hdr = external_call["pread", Int64](
+            self.fd, hdr_buf.unsafe_ptr(), Int64(HDR_BYTES), Int64(0)
+        )
+        if n_hdr != Int64(HDR_BYTES):
+            raise Error("[StreamingRunner] Header-Lesefehler: " + String(n_hdr) + " Bytes")
+
+        var hp = hdr_buf.unsafe_ptr()
+        if hp.bitcast[UInt32]().load(0) != UInt32(0x4F4A4F4D):
+            raise Error("[StreamingRunner] Ungültige Magic-Zahl — kein .mojostream")
+
+        var u32 = hp.bitcast[UInt32]()
+        self.meta.n_layers   = Int(u32.load(4))
+        self.meta.hidden     = Int(u32.load(5))
+        self.meta.kv_dim     = Int(u32.load(6))
+        self.meta.ffn_dim    = Int(u32.load(7))
+        self.meta.n_heads    = Int(u32.load(8))
+        self.meta.n_kv_heads = Int(u32.load(9))
+        var u64 = hp.bitcast[UInt64]()
+        self.meta.n_tensors  = Int(u64.load(5))
+        self.meta.data_start = Int(u64.load(7))
+
+        # ── Step 4: Gemma-4-Shape-Invarianten prüfen (vor Directory-Load) ────
+        self._check_shape()
+
+        # ── Step 5: Tensor-Directory lesen und parsen ────────────────────────
+        var dir_bytes = self.meta.n_tensors * DIR_E_BYTES
+        var dir_buf   = List[UInt8]()
+        dir_buf.resize(dir_bytes, 0)
+        var n_dir = external_call["pread", Int64](
+            self.fd, dir_buf.unsafe_ptr(), Int64(dir_bytes), Int64(HDR_BYTES)
+        )
+        if n_dir != Int64(dir_bytes):
+            raise Error("[StreamingRunner] Directory-Lesefehler: " + String(n_dir)
+                        + " / " + String(dir_bytes) + " Bytes")
+
+        var dp = dir_buf.unsafe_ptr()
+        for i in range(self.meta.n_tensors):
+            var ep   = dp + i * DIR_E_BYTES
+            var eu32 = ep.bitcast[UInt32]()
+            var ef32 = (ep + 16).bitcast[Float32]()
+            var eu64 = (ep + 24).bitcast[UInt64]()
+            var e    = TensorEntry()
+            e.layer_id    = Int(eu32.load(0))
+            e.mat_type    = eu32.load(1)
+            e.rows        = Int(eu32.load(2))
+            e.cols        = Int(eu32.load(3))
+            e.scale       = ef32.load(0)
+            e.data_offset = Int(eu64.load(0))
+            self.entries.append(e^)
+
+        # ── Step 6: Deep Tensor Validation (vor Scratch-Allokierung) ─────────
+        self.validate_tensor_entries(file_size)
+
+        # ── Step 7: Scratch-Buffer allozieren — NUR nach bestandenen Checks ──
         self._init_offsets()
 
-    fn _init_offsets(mut self):
-        """Berechnet Byte-Offsets und -Größen der 7 Matrizen im Scratch-Buffer."""
+    # ── Shape Guard ──────────────────────────────────────────────────────────
+
+    fn _check_shape(self) raises:
+        """Gemma-4-Architektur-Invarianten. Scheitert vor dem Directory-Load."""
+        var D   = self.meta.hidden
+        var NH  = self.meta.n_heads
+        var NKV = self.meta.n_kv_heads
+
+        if NH == 0:
+            raise Error("[ShapeGuard] n_heads = 0")
+        if NKV == 0:
+            raise Error("[ShapeGuard] n_kv_heads = 0")
+        if D % NH != 0:
+            raise Error("[ShapeGuard] hidden=" + String(D)
+                        + " nicht durch n_heads=" + String(NH) + " teilbar")
+        if NH % NKV != 0:
+            raise Error("[ShapeGuard] n_heads=" + String(NH)
+                        + " nicht durch n_kv_heads=" + String(NKV) + " teilbar")
+        var head_dim = D // NH
+        if self.meta.kv_dim != NKV * head_dim:
+            raise Error("[ShapeGuard] kv_dim=" + String(self.meta.kv_dim)
+                        + " erwartet=" + String(NKV * head_dim)
+                        + " (n_kv_heads × head_dim)")
+        if self.meta.n_layers <= 0:
+            raise Error("[ShapeGuard] n_layers <= 0")
+        if self.meta.ffn_dim <= 0:
+            raise Error("[ShapeGuard] ffn_dim <= 0")
+        var exp_tensors = self.meta.n_layers * TENSORS_PER_LAYER
+        if self.meta.n_tensors != exp_tensors:
+            raise Error("[ShapeGuard] n_tensors=" + String(self.meta.n_tensors)
+                        + " erwartet=" + String(exp_tensors)
+                        + " (n_layers × " + String(TENSORS_PER_LAYER) + ")")
+
+    # ── Deep Tensor Validation ────────────────────────────────────────────────
+
+    fn validate_tensor_entries(self, file_size: Int) raises:
+        """Prüft jeden Directory-Eintrag gegen fünf Kriterien:
+          1. ID/Type-Sequenz  (layer_id, mat_type in Inferenz-Reihenfolge)
+          2. Dimensionen      (rows, cols exakt für diesen mat_type)
+          3. 4096-Alignment   (data_offset % 4096 == 0)
+          4. File-Bounds      (offset + size <= file_size)
+          5. Scale-Sanity     (scale > 0)
+        Schlägt sofort mit präziser Fehlermeldung fehl. Kein undefiniertes Verhalten."""
         var D   = self.meta.hidden
         var KVD = self.meta.kv_dim
         var FFD = self.meta.ffn_dim
 
-        # Reihenfolge: Q, K, V, O, Gate, Up, Down (mat_type 1–7)
+        # Erwartete (rows, cols) pro mat_type 0..7
+        var exp_r = List[Int]()
+        var exp_c = List[Int]()
+        exp_r.append(1);   exp_c.append(0)     # 0 PLE   (kein Datenblock)
+        exp_r.append(D);   exp_c.append(D)     # 1 Q
+        exp_r.append(D);   exp_c.append(KVD)   # 2 K
+        exp_r.append(D);   exp_c.append(KVD)   # 3 V
+        exp_r.append(D);   exp_c.append(D)     # 4 O
+        exp_r.append(D);   exp_c.append(FFD)   # 5 Gate
+        exp_r.append(D);   exp_c.append(FFD)   # 6 Up
+        exp_r.append(FFD); exp_c.append(D)     # 7 Down
+
+        var mat_names = List[String]()
+        mat_names.append("PLE"); mat_names.append("Q");   mat_names.append("K")
+        mat_names.append("V");   mat_names.append("O");   mat_names.append("Gate")
+        mat_names.append("Up");  mat_names.append("Down")
+
+        for i in range(len(self.entries)):
+            var e         = self.entries[i].copy()
+            var exp_layer = i // TENSORS_PER_LAYER
+            var exp_type  = i %  TENSORS_PER_LAYER
+            var loc       = "Tensor[" + String(i) + "] Layer " + String(exp_layer) \
+                            + " " + String(mat_names[exp_type])
+
+            # 1. ID/Type-Sequenz
+            if e.layer_id != exp_layer:
+                raise Error("[TensorGuard] " + loc + ": layer_id=" + String(e.layer_id)
+                            + " erwartet=" + String(exp_layer))
+            if Int(e.mat_type) != exp_type:
+                raise Error("[TensorGuard] " + loc + ": mat_type=" + String(Int(e.mat_type))
+                            + " erwartet=" + String(exp_type))
+
+            # 2. Dimensionen
+            if e.rows != exp_r[exp_type]:
+                raise Error("[TensorGuard] " + loc + ": rows=" + String(e.rows)
+                            + " erwartet=" + String(exp_r[exp_type]))
+            if e.cols != exp_c[exp_type]:
+                raise Error("[TensorGuard] " + loc + ": cols=" + String(e.cols)
+                            + " erwartet=" + String(exp_c[exp_type]))
+
+            # 5. Scale-Sanity (für alle Einträge inkl. PLE)
+            if e.scale <= Float32(0):
+                raise Error("[TensorGuard] " + loc + ": scale=" + String(e.scale) + " <= 0")
+
+            # PLE hat keinen Datenblock → Alignment/Bounds überspringen
+            if exp_type == 0:
+                continue
+
+            # 3. 4096-Byte Alignment (SSD Page Boundary)
+            if e.data_offset % 4096 != 0:
+                raise Error("[TensorGuard] " + loc + ": offset=" + String(e.data_offset)
+                            + " nicht 4096-aligned (Modulo=" + String(e.data_offset % 4096) + ")")
+
+            # 4. File-Bounds
+            var expected_bytes = e.rows * (e.cols // 2)
+            var end_offset     = e.data_offset + expected_bytes
+            if end_offset > file_size:
+                raise Error("[TensorGuard] " + loc + ": offset=" + String(e.data_offset)
+                            + " + size=" + String(expected_bytes) + " = " + String(end_offset)
+                            + " > file_size=" + String(file_size))
+
+    # ── Scratch-Buffer Dimensionierung ────────────────────────────────────────
+
+    fn _init_offsets(mut self):
+        """Alloziert Scratch-Buffer nach bestandener Validierung."""
+        var D   = self.meta.hidden
+        var KVD = self.meta.kv_dim
+        var FFD = self.meta.ffn_dim
+
         var sizes = List[Int]()
         sizes.append(D * D   // 2)   # Q
         sizes.append(D * KVD // 2)   # K
@@ -290,8 +465,10 @@ fn run_streaming_bench(ms_path: String, workers: Int) raises:
     var rss0 = rss_mb()
     print("  RSS vor Load:      ", rss0, "MB")
 
+    # Strict Metadata Guard: Header → ShapeGuard → TensorGuard → Scratch-Alloc
     var runner = StreamingRunner(ms_path)
-    # Shape-Check: via MojoStreamFile bereits beim Konstruktor abgedeckt
+    print("  ShapeGuard:        OK")
+    print("  TensorGuard:       OK (", runner.meta.n_tensors, "Einträge geprüft)")
 
     var cfg = Gemma4Config(
         hidden     = runner.meta.hidden,
