@@ -16,8 +16,13 @@ alias HALF_W = SIMD_W // 2          # Bytes pro SIMD-Vektor in gepacktem uint8
 alias MR       = 4    # Mikro-Kernel Zeilen
 alias NR_SIMD  = 2    # SIMD-Vektoren pro Spalten-Tile
 alias NR       = NR_SIMD * SIMD_W  # skalare Spalten pro Tile (= 16)
-alias BM       = 64   # M-Block für parallelize
-alias BK       = 128  # K-Tile (bestimmt B-Puffer-Größe und Cache-Affinität)
+alias BM       = 64   # M-Block für BPack-Kernel
+alias BK       = 128  # K-Tile (B-Puffer = BK×NR×4 = 8 KB → L1d)
+
+# L2-Cache-Blocking für große N (A-Panel-Packing)
+# i7-7500U: 256 KB L2 pro physischem Kern, 2 HT-Threads teilen den L2.
+# Pro Thread: MC×BK×4 = 128×128×4 = 64 KB + B-Puffer 8 KB = 72 KB ≪ 128 KB (halbes L2 ✓)
+alias MC = 128  # MC-Block-Größe für A-Packing
 
 alias PtrT  = UnsafePointer[Scalar[DT], MutAnyOrigin]
 alias U8Ptr = UnsafePointer[UInt8,      MutAnyOrigin]
@@ -259,3 +264,112 @@ fn matmul_q4_bpack_raw(
 
     var w = workers if workers > 0 else num_logical_cores()
     parallelize[process_m_block](num_m_blocks, w)
+
+
+# ---------------------------------------------------------------------------
+# matmul_q4_bpack_l2 – L2-gecachter Kernel mit A-Panel-Packing
+#
+# Skalierungs-invariant: ~100+ GFLOPS für beliebiges N (1024, 4096, 8192).
+#
+# Zusätzliche Tiling-Ebene: M in MC=128-Blöcke.
+# Für jedes (mc, kc)-Tile → A-Panel in MR-block-major Layout umkopieren.
+#   panel[(m_l/MR)*bk*MR + k*MR + (m_l%MR)] = A[m0+m_l, kt+k]
+#   Mikro-Kernel-A-Zugriffe: vollsequenziell aus L2 (kein Stride).
+#
+# Cache-Footprint pro Thread:
+#   A-Panel: 128×128×4 = 64 KB  → L2  (256 KB, 2 HT-Threads teilen = 128 KB/Thread)
+#   B-Puffer: 128×16×4 = 8 KB   → L1d
+# ---------------------------------------------------------------------------
+
+fn matmul_q4_bpack_l2(C: Matrix, A: Matrix, Bq: Q4Matrix, workers: Int = 0):
+    var M     = C.rows
+    var K     = A.cols
+    var N_log = Bq.packed_cols * 2
+    var pcols = Bq.packed_cols
+    var sv    = SIMD[DT, HALF_W](Bq.scale)
+    var n_mc  = (M + MC - 1) // MC
+
+    @parameter
+    fn process_mc(mc_idx: Int):
+        var m0    = mc_idx * MC
+        var m1    = min(m0 + MC, M)
+        var mc    = m1 - m0
+        var aptr  = A.data()
+        var bptr  = Bq.data()
+        var Acols = A.cols
+
+        # A-Panel: MC×BK float32, MR-block-major (64 KB → L2)
+        var a_panel = List[Scalar[DT]]()
+        a_panel.resize(MC * BK, 0)
+        var ap = rebind[PtrT](a_panel.unsafe_ptr())
+
+        # B-Puffer: BK×NR float32, pre-dequant (8 KB → L1d)
+        var b_buf = List[Scalar[DT]]()
+        b_buf.resize(BK * NR, 0)
+        var bp = rebind[PtrT](b_buf.unsafe_ptr())
+
+        for kt in range(0, K, BK):
+            var k1 = min(kt + BK, K)
+            var bk = k1 - kt
+
+            # ── A-Panel-Packing: stride-Acols → sequenziell ───────────────
+            for m_l in range(mc):
+                var mrb     = m_l // MR
+                var mro     = m_l % MR
+                var src_row = (m0 + m_l) * Acols + kt
+                for kl in range(bk):
+                    ap.store(mrb * bk * MR + kl * MR + mro,
+                             aptr.load(src_row + kl))
+
+            # ── N-Schleife ─────────────────────────────────────────────────
+            var nt = 0
+            while nt < N_log:
+                var byte0 = nt // 2
+                var byte1 = byte0 + HALF_W
+
+                # B-Tile pre-dequant in L1-Puffer
+                for kl in range(bk):
+                    var row  = (kt + kl) * pcols
+                    var boff = kl * NR
+                    bp.store[width=SIMD_W](boff,        dequant_vec(bptr, row + byte0, sv))
+                    bp.store[width=SIMD_W](boff+SIMD_W, dequant_vec(bptr, row + byte1, sv))
+
+                # Mikro-Kernel: A aus L2-Panel, B aus L1-Puffer
+                var m   = m0
+                var mrb = 0
+                while m < m1:
+                    var acc00 = SIMD[DT, SIMD_W](0); var acc01 = SIMD[DT, SIMD_W](0)
+                    var acc10 = SIMD[DT, SIMD_W](0); var acc11 = SIMD[DT, SIMD_W](0)
+                    var acc20 = SIMD[DT, SIMD_W](0); var acc21 = SIMD[DT, SIMD_W](0)
+                    var acc30 = SIMD[DT, SIMD_W](0); var acc31 = SIMD[DT, SIMD_W](0)
+
+                    for kl in range(bk):
+                        var boff = kl * NR
+                        var B0   = bp.load[width=SIMD_W](boff)
+                        var B1   = bp.load[width=SIMD_W](boff + SIMD_W)
+                        var poff = mrb * bk * MR + kl * MR
+                        var a0 = ap.load(poff + 0)
+                        var a1 = ap.load(poff + 1)
+                        var a2 = ap.load(poff + 2)
+                        var a3 = ap.load(poff + 3)
+                        acc00 = acc00 + a0 * B0;  acc01 = acc01 + a0 * B1
+                        acc10 = acc10 + a1 * B0;  acc11 = acc11 + a1 * B1
+                        acc20 = acc20 + a2 * B0;  acc21 = acc21 + a2 * B1
+                        acc30 = acc30 + a3 * B0;  acc31 = acc31 + a3 * B1
+
+                    var n1 = nt + SIMD_W
+                    C.store[SIMD_W](m,   nt, C.load[SIMD_W](m,   nt) + acc00)
+                    C.store[SIMD_W](m,   n1, C.load[SIMD_W](m,   n1) + acc01)
+                    C.store[SIMD_W](m+1, nt, C.load[SIMD_W](m+1, nt) + acc10)
+                    C.store[SIMD_W](m+1, n1, C.load[SIMD_W](m+1, n1) + acc11)
+                    C.store[SIMD_W](m+2, nt, C.load[SIMD_W](m+2, nt) + acc20)
+                    C.store[SIMD_W](m+2, n1, C.load[SIMD_W](m+2, n1) + acc21)
+                    C.store[SIMD_W](m+3, nt, C.load[SIMD_W](m+3, nt) + acc30)
+                    C.store[SIMD_W](m+3, n1, C.load[SIMD_W](m+3, n1) + acc31)
+                    m += MR
+                    mrb += 1
+
+                nt += NR
+
+    var w = workers if workers > 0 else num_logical_cores()
+    parallelize[process_mc](n_mc, w)

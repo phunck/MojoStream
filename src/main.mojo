@@ -12,7 +12,7 @@
 from std.time import perf_counter_ns
 from std.sys.info import num_logical_cores
 
-from src.linalg.kernels import Matrix
+from src.linalg.kernels import Matrix, Q4Matrix, matmul_q4_bpack, matmul_q4_bpack_l2
 from src.streaming.loader import ModelRunner, LayerStats
 
 # ── Konfiguration ───────────────────────────────────────────────────────────
@@ -78,6 +78,47 @@ fn print_stats(stats: List[LayerStats], ncores: Int) -> None:
 
 fn main() raises:
     var ncores = num_logical_cores()
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Direkt-Vergleich: BPack vs. L2-BPack für N=1024 und N=4096
+    # ──────────────────────────────────────────────────────────────────────
+    print("══════════════════════════════════════════════════════════")
+    print("  KERNEL SCALING BENCHMARK")
+    print("══════════════════════════════════════════════════════════")
+    # ── N=1024 ──────────────────────────────────────────────────────────────
+    for pass_n in range(2):
+        var nb    = 1024 if pass_n == 0 else 4096
+        var flops_b = 2.0 * Float64(nb) * Float64(nb) * Float64(nb)
+        var Ab  = Matrix(nb, nb);               Ab.fill_random()
+        var Bqb = Q4Matrix(nb, nb, Float32(0.1)); Bqb.fill_random()
+        var Cb  = Matrix(nb, nb)
+
+        matmul_q4_bpack(Cb, Ab, Bqb, ncores)  # warm-up
+        var best1: UInt = UInt.MAX
+        for _ in range(3):
+            Cb.zero()
+            var t0 = perf_counter_ns()
+            matmul_q4_bpack(Cb, Ab, Bqb, ncores)
+            var dt = perf_counter_ns() - t0
+            if dt < best1: best1 = dt
+        var ms1 = Float64(Int(best1)) / 1e6
+        var gf1 = flops_b / (Float64(Int(best1)) / 1e9) / 1e9
+
+        matmul_q4_bpack_l2(Cb, Ab, Bqb, ncores)  # warm-up
+        var best2: UInt = UInt.MAX
+        for _ in range(3):
+            Cb.zero()
+            var t0 = perf_counter_ns()
+            matmul_q4_bpack_l2(Cb, Ab, Bqb, ncores)
+            var dt = perf_counter_ns() - t0
+            if dt < best2: best2 = dt
+        var ms2 = Float64(Int(best2)) / 1e6
+        var gf2 = flops_b / (Float64(Int(best2)) / 1e9) / 1e9
+
+        print("N=", nb, "  BPack:", ms1, "ms /", gf1,
+              "GFLOPS  |  L2-BPack:", ms2, "ms /", gf2, "GFLOPS")
+
+    print()
     print("══════════════════════════════════════════════════════════")
     print("  Q4-Layer-Streaming Inference Simulation")
     print("══════════════════════════════════════════════════════════")
