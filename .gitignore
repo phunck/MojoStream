@@ -1,0 +1,12 @@
+# Generierte Artefakte (Laufzeit)
+*.bin
+*.txt
+__pycache__/
+.ipynb_checkpoints/
+outputs/
+
+# Kompiliertes Mojo-Binary
+matrix_bench
+
+# Claude-interne Dateien
+.claude/
