@@ -5,7 +5,7 @@ from std.algorithm.functional import parallelize
 from std.memory import UnsafePointer, memset_zero
 from std.sys.info import simd_width_of, num_logical_cores
 from std.random import rand
-from std.math import sqrt
+from std.math import sqrt, cos, sin, exp, log
 
 # ---------------------------------------------------------------------------
 # Compile-Zeit Konstanten
@@ -517,13 +517,93 @@ fn ple_scale_inplace(x: PtrT, n_rows: Int, n_cols: Int, scale: Float32):
 
 
 fn swiglu_inplace(gate: PtrT, up: PtrT, n: Int):
-    """SwiGLU-Aktivierungsfunktion für Gemma 4 FFN (in-place auf up).
-    Vollständig: up[i] = up[i] * gate[i] * sigmoid(gate[i])
-    Dieser Placeholder multipliziert nur gate × up (lässt sigmoid weg).
-    TODO: Echte SiLU-Aktivierung via Polynomial-Approximation implementieren."""
+    """SwiGLU: up[i] = up[i] * silu(gate[i]),  silu(x) = x * sigmoid(x)."""
     var i = 0
-    while i < n:
-        var g = gate.load[width=SIMD_W](i)
-        var u = up.load[width=SIMD_W](i)
-        up.store[width=SIMD_W](i, u * g)   # Placeholder: kein sigmoid-Faktor
+    while i + SIMD_W <= n:
+        var g   = gate.load[width=SIMD_W](i)
+        var u   = up.load[width=SIMD_W](i)
+        var sig = SIMD[DT, SIMD_W](1.0) / (SIMD[DT, SIMD_W](1.0) + exp(-g))
+        up.store[width=SIMD_W](i, u * g * sig)
         i += SIMD_W
+    while i < n:
+        var g = gate.load(i)
+        var u = up.load(i)
+        up.store(i, u * g / (Float32(1.0) + exp(-g)))
+        i += 1
+
+
+# ===========================================================================
+# TASK 1 – RoPE (Rotary Positional Embeddings)
+#
+# Gemma 4 wendet RoPE auf jeden Query- und Key-Kopf an, bevor das
+# Attention-Dot-Product berechnet wird. Das codiert relative Positionen
+# direkt in die Vektoren, ohne separate Positional-Embedding-Tabelle.
+#
+# Rotation der Paare (x[i], x[i+half]) mit Frequenz θ_i:
+#   x_rot[i]      = x[i] * cos(θ_i) – x[i+half] * sin(θ_i)
+#   x_rot[i+half] = x[i] * sin(θ_i) + x[i+half] * cos(θ_i)
+#
+# θ_i = pos / base^(2i/head_dim)
+#      = pos * exp(–2i/head_dim * ln(base))
+#
+# Optimierung: cos/sin-Tabelle einmalig für die aktuelle Position berechnen
+# (O(head_dim/2) skalare Aufrufe), dann SIMD-Rotation über alle n_heads.
+# ===========================================================================
+
+fn apply_rope_inplace(
+    ptr:      PtrT,
+    n_heads:  Int,
+    head_dim: Int,
+    pos:      Int,
+    base:     Float32 = 10000.0,
+):
+    """RoPE in-place. ptr zeigt auf flat buffer (n_heads × head_dim).
+    Paare: (x[i], x[i+half]) für i in 0..half."""
+    var half    = head_dim // 2
+    var ln_base = log(base)   # ln(10000) ≈ 9.2103
+
+    var cos_buf = List[Scalar[DT]]()
+    var sin_buf = List[Scalar[DT]]()
+    cos_buf.resize(half, 0)
+    sin_buf.resize(half, 0)
+    var cp = rebind[PtrT](cos_buf.unsafe_ptr())
+    var sp = rebind[PtrT](sin_buf.unsafe_ptr())
+
+    var pos_f = Float32(pos)
+    for i in range(half):
+        var inv_freq = exp(-Float32(2 * i) / Float32(head_dim) * ln_base)
+        var theta    = pos_f * inv_freq
+        cp.store(i, cos(theta))
+        sp.store(i, sin(theta))
+
+    for h in range(n_heads):
+        var hp = ptr + h * head_dim
+        var i  = 0
+        while i + SIMD_W <= half:
+            var xi  = hp.load[width=SIMD_W](i)
+            var xih = hp.load[width=SIMD_W](i + half)
+            var cv  = cp.load[width=SIMD_W](i)
+            var sv  = sp.load[width=SIMD_W](i)
+            hp.store[width=SIMD_W](i,        xi * cv - xih * sv)
+            hp.store[width=SIMD_W](i + half, xi * sv + xih * cv)
+            i += SIMD_W
+        while i < half:
+            var xi  = hp.load(i);  var xih = hp.load(i + half)
+            var cv  = cp.load(i);  var sv  = sp.load(i)
+            hp.store(i,        xi * cv - xih * sv)
+            hp.store(i + half, xi * sv + xih * cv)
+            i += 1
+
+
+fn silu_inplace(x: PtrT, n: Int):
+    """SiLU in-place: x[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(–x[i]))."""
+    var i = 0
+    while i + SIMD_W <= n:
+        var v   = x.load[width=SIMD_W](i)
+        var sig = SIMD[DT, SIMD_W](1.0) / (SIMD[DT, SIMD_W](1.0) + exp(-v))
+        x.store[width=SIMD_W](i, v * sig)
+        i += SIMD_W
+    while i < n:
+        var v = x.load(i)
+        x.store(i, v / (Float32(1.0) + exp(-v)))
+        i += 1
