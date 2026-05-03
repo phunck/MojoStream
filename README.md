@@ -54,6 +54,20 @@ Hardware reference: **Intel i7-7500U** (2 physical cores / 4 logical, AVX2, 16 G
 **True Streaming** — per step: I/O 30 ms · Compute 149 ms · I/O-Wartezeit **0 ms** (compute-bound).  
 Peak RSS: **248 MB** — konstant über alle Steps, unabhängig von der Modelldateigröße.
 
+### Gemma-4 E4B Real Weights (D=2560, 42 layers, 1.97 GB Q4)
+
+| Metric | Value | Notes |
+|---|---:|---|
+| **TTFT compute** | **2 210 ms** | 42-layer forward pass, 4 threads, weights in RAM |
+| **TTFT incl. I/O** | **7 545 ms** | 1.97 GB load from SATA SSD + compute |
+| **Streaming t/s** | **~0.45 t/s** | After TTFT, each subsequent token ≈ 87–90 ms |
+| **KV-Cache** | **88 MB** | 35×(512×512) sliding + 7×(256×1024) full attention |
+| **Sliding head_dim** | 256 | `rope_theta=1e4`, full rotation |
+| **Full head_dim** | 512 | `rope_theta=1e6`, partial rotation 128 dims |
+| **Model load** | ~5 300 ms | SATA SSD, 1.97 GB sequential read |
+
+> For context: `pixi run e4b-infer` runs the full TTFT benchmark and then streams 7 additional tokens.
+
 ### Numerical Validation
 
 ```
@@ -330,6 +344,9 @@ The `validate_gemma4_shape()` ShapeGuard runs automatically on every `.mojostrea
 | 2026-05 | **Strict Metadata Guard** — ShapeGuard + Deep TensorGuard (5 checks/entry) | Fail-fast, no undefined behavior |
 | 2026-05 | **Gemma-4 E4B Conversion** — BF16 SafeTensors → INT4 .mojostream, GQA sliding/full layers | **1.973 GB, [PASS] 12/12** |
 | 2026-05 | **Engram Header** — PLE-Scales + KV-Cache metadata reserved in header bytes 64–127 | kv_shared=18, ple_dim=256 |
+| 2026-05 | **E4B Hybrid Inference** — `dequantize_block[w]`, HybridKVCache, zero-copy E4BLayerRef | TTFT 2 210 ms, 0.45 t/s |
+| 2026-05 | **Heap Corruption Fix** — Down proj `packed_cols` corrected (FFD/2→D/2); stable 42-layer run | Layer 17 crash eliminated |
+| 2026-05 | **Token Streaming** — auto-regressive loop with `write()` syscall, per-token TTFT reporting | Live character output |
 
 ---
 
@@ -432,6 +449,31 @@ estimated **~0.8 t/s** on the dev machine (SATA, single token decode).
 ## Tokenizer Note
 
 > The current tokenizer is an ASCII/BPE prototype for pipeline validation. A full UTF-8/SentencePiece implementation is on the roadmap.
+
+---
+
+## Technical Debt / Bug Log
+
+Documented post-mortems for non-obvious bugs. Each entry explains the root cause so the failure mode is not repeated.
+
+### Layer 17 Heap Corruption — Down Projection Dimension Error
+
+**Commit fixed:** `2b4a6d3`  
+**Symptom:** Stable inference through layers 0–16, crash (SIGSEGV) inside Mojo's async runtime at the start of layer 17's compute. Layers 5 and 11 (also full-attention) passed without issue.  
+**Root cause:**  
+In `load_e4b_layer_ref`, the Down-projection weight's `packed_cols` was set to `E4B_FFD // 2 = 5120` instead of the correct `E4B_D // 2 = 1280`.
+
+The Down weight has logical shape `(FFD, D) = (10240, 2560)`, stored packed as `(FFD × D/2)` bytes. `packed_cols` in `matmul_q4_bpack_raw` represents `output_cols / 2`, so the correct value is `D/2 = 1280`. Gate and Up weights have shape `(D, FFD)` and correctly use `FFD/2 = 5120`.
+
+With `packed_cols = 5120`, the kernel computed `N_log = 10240` (should be 2560) and wrote the accumulated results into `ffn_out = Matrix(4, 2560)` at column indices up to 10224. For batch row `m=3`, the writes started out-of-bounds at index `3×2560 + 2560 = 10240`, overflowing the 10240-element storage array by up to 7664 floats per layer call. This silently corrupted adjacent heap allocations on every layer. After 16 accumulations of corruption, a critical pointer was overwritten, causing the SIGSEGV at layer 17.
+
+**Why not caught earlier:** Layers 5 and 11 (full-attention, same code path) completed without crash because the heap region beyond `ffn_out` happened to contain non-critical data that was overwritten and re-allocated before being accessed for a fatal dereference.
+
+**Fix:** One-line change — `dt.ptr, E4B_FFD // 2` → `dt.ptr, E4B_D // 2`.
+
+**Lesson:** When mapping weight shapes through the `(K, N)` → `(K, N/2)` packing convention, always derive `packed_cols` from the **output** dimension `N`, not the input dimension `K`. For asymmetric weight matrices, the two are not interchangeable.
+
+---
 
 ## License
 
