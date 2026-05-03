@@ -267,6 +267,31 @@ pixi run validate-real
 # Expected: [PASS] TensorGuard: 12/12 checks  checksum 0x01B27076
 ```
 
+### Run Real-Weight Inference with Token Streaming
+
+Requires `models/gemma4_e4b_q4.mojostream` (generate with `pixi run convert`).
+
+```bash
+pixi run e4b-infer
+```
+
+Expected output (characters appear one-by-one as each token is computed):
+
+```
+[1/4] Lade .mojostream ...
+  Geladen: 1.97 GB  in ~5300 ms
+[3/4] TTFT-Messung ...
+  TTFT: ~2045 ms
+[4/4] Echtzeit-Streaming  (jedes Zeichen erscheint sofort) ...
+MojoStream > ////////
+
+  TTFT (1. Token):          2045 ms
+  Ø pro Token (Streaming):  ~2028 ms/Token  (~0.49 t/s)
+  KV-Cache Footprint:       88 MB
+```
+
+The proxy tokenizer maps `argmax |hidden[0, :512]|` to a printable ASCII character. With a real vocabulary and lm_head projection, this would output actual text.
+
 ---
 
 ## Testing Strategy
