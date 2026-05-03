@@ -607,3 +607,174 @@ fn silu_inplace(x: PtrT, n: Int):
         var v = x.load(i)
         x.store(i, v / (Float32(1.0) + exp(-v)))
         i += 1
+
+
+# ===========================================================================
+# AVX2-BREITE INT4-DEQUANTISIERUNG + FUSED MATMUL
+#
+# Der klassische B-Pack-Kernel dequantisiert 4 Bytes → 8 Float32 (SIMD_W=8).
+# Dieser Abschnitt erweitert auf 32 Bytes → 64 Float32 pro K-Schritt:
+#   • 8× breitere SIMD-Auslastung pro Lade-Instruktion
+#   • Kein L1-Zwischen-Puffer: Dequant on-the-fly (Fused mit FMA)
+#   • 4096-Byte Page-Aligned Tensor-Zugriff (.mojostream-Format)
+# ===========================================================================
+
+# Tile-Breite des neuen Kernels
+alias NR_FW : Int = 32   # Q4-Bytes pro K-Schritt (= 64 Float-Spalten)
+alias NR_FC : Int = 64   # Float-Spalten pro K-Schritt (2 × NR_FW)
+
+
+struct Q4Nibbles(Copyable, Movable):
+    """Entpacktes INT4-Paar: 32 Bytes → 32 Low- + 32 High-Nibble Float32-Werte.
+    Repräsentiert 64 dequantisierte Gewichte, gerade und ungerade Spalten getrennt."""
+    var lo: SIMD[DT, 32]   # Gerade Spalten (col 0, 2, 4, ..., 62), dequantisiert
+    var hi: SIMD[DT, 32]   # Ungerade Spalten (col 1, 3, 5, ..., 63), dequantisiert
+
+    fn __init__(out self, lo: SIMD[DT, 32], hi: SIMD[DT, 32]):
+        self.lo = lo; self.hi = hi
+
+    fn copy(self) -> Self: return Self(self.lo, self.hi)^
+
+    fn interleaved(self) -> SIMD[DT, 64]:
+        """Gibt Werte in Spalten-Reihenfolge zurück:
+        [col0, col1, col2, col3, ...] via interleave(lo, hi)."""
+        return self.lo.interleave(self.hi)
+
+
+fn unpack_nibbles(bytes: SIMD[DType.uint8, 32], scale: Float32) -> Q4Nibbles:
+    """
+    Entpackt 32 Q4-Bytes (256 Bit) in 64 Float32-Werte via AVX2-Bit-Magic.
+
+    Bit-Operationen (entsprechen je 1 AVX2-Instruktion):
+      low  = bytes & 0x0F              VPAND ymm
+      high = (bytes >> 4) & 0x0F      VPSRLW ymm + VPAND ymm
+      cast int8 & subtract -8         VPMOVSXBW + VPSUBW
+      multiply by scale               VCVTDQ2PS + VMULPS
+
+    Symmetric Mapping: Q4 uint [0,15] → signed [-8,7] → float × scale
+    Kein Zwischen-Puffer — Ergebnis lebt in AVX2-Registern.
+    """
+    var mask = SIMD[DType.uint8, 32](0x0F)
+    var bias = SIMD[DType.int8,  32](8)
+    var sv   = SIMD[DT, 32](scale)
+
+    var lo_u8 = bytes & mask
+    var hi_u8 = (bytes >> SIMD[DType.uint8, 32](4)) & mask
+    var lo_f  = (lo_u8.cast[DType.int8]() - bias).cast[DT]() * sv
+    var hi_f  = (hi_u8.cast[DType.int8]() - bias).cast[DT]() * sv
+
+    return Q4Nibbles(lo_f, hi_f)
+
+
+@always_inline
+fn dequant_block32_interleaved(
+    ptr:      U8Ptr,
+    byte_off: Int,
+    sv:       SIMD[DT, 32],
+) -> SIMD[DT, 64]:
+    """Lädt 32 Q4-Bytes und gibt 64 Float32 in Spalten-Reihenfolge zurück.
+    Direkte Fusion mit FMA — keine Write-Back in L1-Puffer.
+
+    Ergebnis: [col0, col1, col2, col3, ..., col62, col63]
+    via interleave(low_nibbles, high_nibbles) × scale."""
+    var p    = ptr.load[width=32](byte_off)
+    var mask = SIMD[DType.uint8, 32](0x0F)
+    var bias = SIMD[DType.int8,  32](8)
+    var lo   = (p & mask).cast[DType.int8]() - bias
+    var hi   = ((p >> SIMD[DType.uint8, 32](4)) & mask).cast[DType.int8]() - bias
+    return (lo.cast[DT]() * sv).interleave(hi.cast[DT]() * sv)
+
+
+fn matmul_q4_fused_avx2(C: Matrix, A: Matrix, Bq: Q4Matrix, workers: Int = 0):
+    """
+    Fused INT4-Dequant + MatMul — kein L1-Zwischen-Puffer.
+
+    Unterschied zu matmul_q4_bpack (B-Pack):
+      Kein B-Buffer:   Dequant direkt in AVX2-Register, sofort FMA
+      Breitere SIMD:   32 Bytes → 64 Float32 (vs. 4 → 8 im B-Pack)
+      Page-Alignment:  4096-Byte-ausgerichtete Tensor-Zugriffe (.mojostream)
+
+    Loop-Unrolling: 4 explizite Akkumulator-Zeilen
+      = '#pragma unroll 4' für die M-Dimension (MR=4)
+
+    Einschränkung: N muss Vielfaches von NR_FC=64 sein.
+    Gemma-4-Dimensionen (D=1024/2048/4096) sind alle ≡ 0 (mod 64). ✓
+    """
+    var M      = C.rows
+    var N_log  = Bq.packed_cols * 2
+    var K      = A.cols
+    var pcols  = Bq.packed_cols
+    var sv     = SIMD[DT, NR_FW](Bq.scale)
+    var n_mb   = (M + MR - 1) // MR
+
+    @parameter
+    fn process_m_block(mb: Int):
+        var m0    = mb * MR
+        var aptr  = A.data()
+        var bptr  = Bq.data()
+        var Acols = K
+
+        # ── N-Schleife: 64 Spalten pro Iteration ─────────────────────────
+        var nt = 0
+        while nt + NR_FC <= N_log:
+            var byte0 = nt // 2   # erster Byte-Offset für dieses 64-Spalten-Tile
+
+            # Akkumulatoren: 4 Zeilen × 64 Spalten
+            # Explizit unrollt (≡ #pragma unroll 4) für maximale Pipeline-Auslastung
+            var acc0 = SIMD[DT, NR_FC](0)
+            var acc1 = SIMD[DT, NR_FC](0)
+            var acc2 = SIMD[DT, NR_FC](0)
+            var acc3 = SIMD[DT, NR_FC](0)
+
+            # ── K-Schleife: Fused Dequant + Skalar-Broadcast-FMA ─────────
+            for k in range(K):
+                # A-Skalare für alle 4 Zeilen vorladen (Out-of-Order-freundlich)
+                var base = m0 * Acols + k
+                var a0   = aptr.load(base)
+                var a1   = aptr.load(base + Acols)
+                var a2   = aptr.load(base + 2 * Acols)
+                var a3   = aptr.load(base + 3 * Acols)
+
+                # 32 Q4-Bytes → 64 Float32 on-the-fly (kein L1-Write)
+                var dq = dequant_block32_interleaved(bptr, k * pcols + byte0, sv)
+
+                # FMA: Skalar-Broadcast × dequantisierter Spaltenvektor
+                acc0 = acc0 + SIMD[DT, NR_FC](a0) * dq
+                acc1 = acc1 + SIMD[DT, NR_FC](a1) * dq
+                acc2 = acc2 + SIMD[DT, NR_FC](a2) * dq
+                acc3 = acc3 + SIMD[DT, NR_FC](a3) * dq
+
+            # Ergebnis in C akkumulieren (64 Spalten in einem Store)
+            C.store[NR_FC](m0,   nt, C.load[NR_FC](m0,   nt) + acc0)
+            C.store[NR_FC](m0+1, nt, C.load[NR_FC](m0+1, nt) + acc1)
+            C.store[NR_FC](m0+2, nt, C.load[NR_FC](m0+2, nt) + acc2)
+            C.store[NR_FC](m0+3, nt, C.load[NR_FC](m0+3, nt) + acc3)
+            nt += NR_FC
+
+        # Tail (N nicht Vielfaches von 64): Fallback auf B-Pack NR=16
+        while nt + NR <= N_log:
+            var byte0 = nt // 2
+            var byte1 = byte0 + HALF_W
+            var bsv   = SIMD[DT, HALF_W](Bq.scale)
+            var b_buf = List[Scalar[DT]](); b_buf.resize(K * NR, 0)
+            var bp    = rebind[PtrT](b_buf.unsafe_ptr())
+            for kl in range(K):
+                var row  = kl * pcols
+                var boff = kl * NR
+                bp.store[width=SIMD_W](boff,         dequant_vec(bptr, row + byte0, bsv))
+                bp.store[width=SIMD_W](boff + SIMD_W, dequant_vec(bptr, row + byte1, bsv))
+            var m = m0
+            while m < min(m0 + MR, M):
+                var t0 = SIMD[DT, SIMD_W](0); var t1 = SIMD[DT, SIMD_W](0)
+                for kl in range(K):
+                    var boff = kl * NR
+                    var av   = aptr.load(m * Acols + kl)
+                    t0 = t0 + av * bp.load[width=SIMD_W](boff)
+                    t1 = t1 + av * bp.load[width=SIMD_W](boff + SIMD_W)
+                C.store[SIMD_W](m, nt,         C.load[SIMD_W](m, nt)         + t0)
+                C.store[SIMD_W](m, nt + SIMD_W, C.load[SIMD_W](m, nt + SIMD_W) + t1)
+                m += 1
+            nt += NR
+
+    var w = workers if workers > 0 else num_logical_cores()
+    parallelize[process_m_block](n_mb, w)
