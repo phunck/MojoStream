@@ -21,6 +21,7 @@ Branch: main  |  Mojo: 0.26.2  |  Target: x86-64 AVX2  |  License: Apache 2.0
 | Numerical Validation Layer 0 | ✅ **[PASS]** rel. RMSE 1.77e-6 | 2026-05 |
 | P95 Benchmark Harness + JSON output | ✅ Stable | 2026-05 |
 | True Streaming Mode (pread, RSS tracking) | ✅ Stable | 2026-05 |
+| Strict Metadata Guard (ShapeGuard + TensorGuard) | ✅ Stable | 2026-05 |
 | Real Gemma 4 Weights (SafeTensors loader) | 📋 Planned | — |
 | All 40 Layers Validated | 📋 Pending real weights | — |
 
@@ -135,7 +136,21 @@ DATA              Q4 tensors, each block starting at 4096-byte SSD page boundary
 **Advantage over loose files:**
 - 1 file open vs. 40 → eliminates seek overhead on SATA/NVMe
 - Sequential read saturates disk bandwidth (DMA-friendly)
-- ShapeGuard validates all dimensions on load before any inference
+- Robust metadata validation with zero-copy safety checks
+
+**Validation on every load (Fail-Fast):**
+
+| Check | What it validates |
+|---|---|
+| Magic `MOJOSTRM` | File is a valid .mojostream |
+| `ShapeGuard` | `hidden % n_heads == 0`, `kv_dim == n_kv_heads × head_dim`, `n_tensors == n_layers × 8` |
+| `TensorGuard` — ID/Type | Every entry is in exact layer/matrix inference order |
+| `TensorGuard` — Dimensions | `rows/cols` match Q/K/V/O/Gate/Up/Down spec for D, KVD, FFD |
+| `TensorGuard` — Alignment | `data_offset % 4096 == 0` (SSD page boundary) |
+| `TensorGuard` — Bounds | `offset + size ≤ file_size` (no out-of-bounds read) |
+| `TensorGuard` — Scale | `scale > 0` for every matrix and PLE entry |
+
+If any check fails, the engine aborts with a precise error (e.g. `[TensorGuard] Tensor[1] Layer 0 Q: offset=12290 nicht 4096-aligned (Modulo=2)`) before any buffer is allocated or pointer is dereferenced.
 
 Generate demo model (D=1024, 40 layers, 178 MB):
 ```bash
@@ -234,7 +249,7 @@ python3 scripts/gen_reference.py /path/to/model.mojostream layer0_ref.bin --laye
 pixi run mojo validate.mojo   # [PASS] → clear layer 1, 2, ...
 ```
 
-The `validate_gemma4_shape()` ShapeGuard runs automatically on every load — wrong dimensions fail fast before any computation.
+The `validate_gemma4_shape()` ShapeGuard and `validate_tensor_entries()` TensorGuard run automatically on every load — wrong dimensions or corrupt data fail fast before any computation or buffer allocation.
 
 ---
 
@@ -276,6 +291,7 @@ The `validate_gemma4_shape()` ShapeGuard runs automatically on every load — wr
 | 2026-05 | **BPE Tokenizer** — binary vocab, encode/decode, round-trip verified | "Hallo Mojo" ✓ |
 | 2026-05 | **Numerical Validation** — ShapeGuard + Layer-0 NumPy cross-check | **[PASS] 1.77e-6** |
 | 2026-05 | **True Streaming Mode** — pread/layer, MappedLayerRef, RSS tracking | **248 MB** peak, 0 ms I/O wait |
+| 2026-05 | **Strict Metadata Guard** — ShapeGuard + Deep TensorGuard (5 checks/entry) | Fail-fast, no undefined behavior |
 
 ---
 
