@@ -10,6 +10,7 @@ build-fl      = "mojo build first_light.mojo -o first_light"
 bench         = "mojo src/main.mojo"
 convert       = "python scripts/convert.py weights/gemma-4-e4b-raw models/gemma4_e4b_q4.mojostream"
 validate-real = "mojo src/tests/validate_real.mojo"
+e4b-infer     = "mojo gemma4_e4b_infer.mojo"
 
 [dependencies]
 modular = ">=26.2.0,<27"

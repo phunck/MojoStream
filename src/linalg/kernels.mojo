@@ -666,6 +666,32 @@ fn unpack_nibbles(bytes: SIMD[DType.uint8, 32], scale: Float32) -> Q4Nibbles:
     return Q4Nibbles(lo_f, hi_f)
 
 
+# ---------------------------------------------------------------------------
+# dequantize_block[width] – allgemeiner SIMD-Dequantisierungs-Kernel
+#
+# Nimmt `width` gepackte Q4-Bytes und gibt `width*2` Float32-Werte zurück.
+# Jedes Byte enthält zwei 4-Bit-Nibbles (symmetric INT4, bias=8):
+#   low  nibble → gerade Spalten  (col 0, 2, 4, ...)
+#   high nibble → ungerade Spalten (col 1, 3, 5, ...)
+# Ergebnis in Spalten-Reihenfolge via interleave(lo, hi) × scale.
+#
+# Typische Nutzung:
+#   var bytes = ptr.load[width=HALF_W](offset)           # HALF_W=4 Bytes
+#   var f32   = dequantize_block[HALF_W](bytes, scale)   # → SIMD[f32, SIMD_W=8]
+# ---------------------------------------------------------------------------
+@always_inline
+fn dequantize_block[width: Int](
+    data:  SIMD[DType.uint8, width],
+    scale: Float32,
+) -> SIMD[DType.float32, width * 2]:
+    var mask = SIMD[DType.uint8, width](0x0F)
+    var bias = SIMD[DType.int8,  width](8)
+    var sv   = SIMD[DType.float32, width](scale)
+    var lo_f = ((data & mask).cast[DType.int8]() - bias).cast[DType.float32]() * sv
+    var hi_f = (((data >> SIMD[DType.uint8, width](4)) & mask).cast[DType.int8]() - bias).cast[DType.float32]() * sv
+    return rebind[SIMD[DType.float32, width * 2]](lo_f.interleave(hi_f))
+
+
 @always_inline
 fn dequant_block32_interleaved(
     ptr:      U8Ptr,
