@@ -31,6 +31,40 @@ alias VAL_BATCH : Int    = 4
 alias PASS_TOL  : Float64 = 1e-4        # relative RMSE-Schwelle
 
 
+# ── NaN / Inf Stabilitätsprüfung ─────────────────────────────────────────────
+
+fn has_nan_or_inf(m: Matrix) -> Bool:
+    """Gibt True zurück wenn die Matrix NaN oder Inf enthält (IEEE 754).
+    Genutzt nach einem Forward-Pass mit echten Gewichten um Overflow/Underflow
+    zu erkennen bevor mit dem Modell weitergearbeitet wird."""
+    var ptr = m.data()
+    var n   = m.rows * m.cols
+    for i in range(n):
+        var v = ptr.load(i)
+        if v != v:   # NaN: IEEE 754 – NaN ist das einzige Float das ungleich sich selbst ist
+            return True
+        if v > Float32(1e30) or v < Float32(-1e30):   # +/- Inf
+            return True
+    return False
+
+
+fn check_matrix_stability(m: Matrix, name: String) -> Bool:
+    """Prüft Matrix auf NaN/Inf und gibt detaillierten Report.
+    Returns True wenn stabil."""
+    if has_nan_or_inf(m):
+        print("  [INSTABIL] ", name, ": NaN oder Inf gefunden!")
+        return False
+    var ptr = m.data()
+    var n   = m.rows * m.cols
+    var max_abs = Float32(0)
+    for i in range(n):
+        var v = ptr.load(i)
+        var av = v if v >= Float32(0) else -v
+        if av > max_abs: max_abs = av
+    print("  [OK]       ", name, ": max_abs =", max_abs)
+    return True
+
+
 # ── Referenzdatei laden ──────────────────────────────────────────────────────
 
 struct RefData(Movable):
