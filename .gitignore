@@ -5,6 +5,11 @@ __pycache__/
 .ipynb_checkpoints/
 outputs/
 
+# Modell-Gewichte und konvertierte Dateien (zu groß für Git)
+weights/
+models/
+*.mojostream
+
 # Kompilierte Mojo-Binaries
 matrix_bench
 mojo_inference
@@ -12,3 +17,6 @@ test_import
 
 # Claude-interne Dateien
 .claude/
+
+# Secrets and environment variables
+.env

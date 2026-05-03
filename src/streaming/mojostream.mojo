@@ -205,11 +205,10 @@ struct MojoStreamFile(Movable):
             raise Error("ShapeGuard: n_heads (" + String(NH) +
                         ") nicht durch n_kv_heads (" + String(NKV) + ") teilbar")
 
-        var head_dim = D // NH
-        var kv_dim_expected = NKV * head_dim
-        if self.meta.kv_dim != kv_dim_expected:
+        # Gemma-4 E4B hat head_dim=256 ≠ hidden/n_heads=320; nur Teilbarkeit prüfen
+        if NKV > 0 and self.meta.kv_dim % NKV != 0:
             raise Error("ShapeGuard: kv_dim=" + String(self.meta.kv_dim) +
-                        " ≠ n_kv_heads*head_dim=" + String(kv_dim_expected))
+                        " nicht durch n_kv_heads=" + String(NKV) + " teilbar")
         if self.meta.n_layers <= 0:
             raise Error("ShapeGuard: n_layers <= 0")
         if self.meta.ffn_dim <= 0:

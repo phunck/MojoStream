@@ -5,10 +5,13 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-first-light = "mojo first_light.mojo"
-build-fl    = "mojo build first_light.mojo -o first_light"
-bench       = "mojo src/main.mojo"
+first-light   = "mojo first_light.mojo"
+build-fl      = "mojo build first_light.mojo -o first_light"
+bench         = "mojo src/main.mojo"
+convert       = "python scripts/convert.py weights/gemma-4-e4b-raw models/gemma4_e4b_q4.mojostream"
+validate-real = "mojo src/tests/validate_real.mojo"
 
 [dependencies]
 modular = ">=26.2.0,<27"
 c-compiler = "*"
+huggingface_hub = ">=0.36.0,<0.37"
