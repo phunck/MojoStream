@@ -22,7 +22,7 @@ from src.linalg.kernels import Matrix, DT
 from src.streaming.sparse_pin import SparsePinEngine
 from src.tokenizer.gemma_proto import TokenMap, load_token_map
 from src.inference.lm_head import (
-    LMHead, load_lm_head, apply_bos_embedding,
+    LMHead, load_lm_head, apply_bos_embedding, apply_final_norm,
     project_lm_head, temperature_sampling, get_token_embedding,
 )
 from src.inference.gemma4_e4b import (
@@ -30,12 +30,16 @@ from src.inference.gemma4_e4b import (
     E4B_D, E4B_N_LAYERS, E4B_BATCH,
 )
 
-comptime MODEL_PATH  : String = "models/gemma4_e4b_q4.mojostream"
-comptime VOCAB_PATH  : String = "vocab_proto.bin"
-comptime LM_HEAD_PATH: String = "lm_head_proto.bin"
-comptime MAX_FULL_SEQ: Int    = 256
-comptime N_STREAM    : Int    = 7
-comptime TEMPERATURE : Float32 = 0.7   # Sampling-Temperatur (0 = greedy)
+comptime MODEL_PATH        : String  = "models/gemma4_e4b_q4.mojostream"
+comptime VOCAB_PATH        : String  = "vocab_proto.bin"
+comptime LM_HEAD_PATH      : String  = "lm_head_proto.bin"
+comptime MAX_FULL_SEQ      : Int     = 256
+comptime N_STREAM          : Int     = 7
+comptime TEMPERATURE       : Float32 = 0.7   # Sampling-Temperatur (0 = greedy)
+comptime REPETITION_PENALTY: Float32 = 1.2   # Penalty für bereits generierte Token
+
+# Validierungs-Prompt "The capital of France is" (Token-IDs für vocab_proto.bin)
+comptime VALIDATION_PROMPT_LEN: Int = 6
 
 
 fn prepare_next_input(mut x: Matrix, lm: LMHead, token_id: Int):
@@ -91,36 +95,59 @@ fn run(workers: Int) raises:
     print("  KV-Cache:", kv.memory_mb(), "MB")
     print("  BOS-Embedding: echtes embed_tokens.weight[2] (nicht Random)")
 
-    # ── [5] TTFT: BOS-Token durch alle 42 Layer ───────────────────────────
+    # ── [5] TTFT: Prompt-Token durch alle 42 Layer ────────────────────────
+    # Prompt "The capital of France is": Token-IDs [2, 603, 5012, 575, 4124, 608]
+    # Token 2 = BOS (echtes Embedding), die restlichen 5 via get_token_embedding
+    var prompt_ids = List[Int]()
+    prompt_ids.append(2)
+    prompt_ids.append(603)
+    prompt_ids.append(5012)
+    prompt_ids.append(575)
+    prompt_ids.append(4124)
+    prompt_ids.append(608)
+
     print()
-    print("[5/6] TTFT (BOS ID=2, base_pos=0) ...")
+    print("[5/6] TTFT (Prompt:", VALIDATION_PROMPT_LEN, "Token, BOS+5) ...")
     engine.reset_stats()
     var t_ttft = perf_counter_ns()
 
-    for layer in range(E4B_N_LAYERS):
-        engine.advance(layer)
-        var w = engine.get_layer_ref(layer)
-        e4b_forward_layer(x, layer, w, kv, 0, workers)
+    for pi in range(VALIDATION_PROMPT_LEN):
+        var base_pos = pi
+        if pi == 0:
+            apply_bos_embedding(x, lm)
+        else:
+            prepare_next_input(x, lm, prompt_ids[pi])
 
-        if (layer + 1) % 14 == 0 or layer == E4B_N_LAYERS - 1:
+        for layer in range(E4B_N_LAYERS):
+            engine.advance(layer)
+            var w = engine.get_layer_ref(layer)
+            e4b_forward_layer(x, layer, w, kv, base_pos, workers)
+
+        if pi == VALIDATION_PROMPT_LEN - 1 or pi % 2 == 1:
             var e = Float64(Int(perf_counter_ns() - t_ttft)) / 1e6
-            print("  Layer", layer + 1, "/ 42   (", e, "ms)")
+            print("  Prompt step", pi + 1, "/", VALIDATION_PROMPT_LEN, "(", e, "ms)")
 
     var ttft_ms = Float64(Int(perf_counter_ns() - t_ttft)) / 1e6
 
-    # LM-Head Projektion → erstes Token
-    var logits0 = Matrix(E4B_BATCH, lm.vocab_n)
+    # Final RMSNorm (model.norm.weight) + LM-Head → erstes generiertes Token
+    apply_final_norm(x, lm)
+    var logits0    = Matrix(E4B_BATCH, lm.vocab_n)
+    var prompt_gen = List[Int]()   # Prompt-Token für Repetition-Penalty
+    for pi in range(VALIDATION_PROMPT_LEN):
+        prompt_gen.append(prompt_ids[pi])
     project_lm_head(logits0, x, lm, workers)
-    var first_token = temperature_sampling(logits0, TEMPERATURE)
+    var first_token = temperature_sampling(logits0, TEMPERATURE,
+                                           prompt_gen, REPETITION_PENALTY)
     var first_text  = token_map.decode(first_token)
     print("  TTFT:", ttft_ms, "ms  →  Token", first_token,
           "=", repr(first_text))
+    print("  LM-Head dtype: FP32" if lm.use_fp32 else "  LM-Head dtype: Q4")
     engine.print_io_stats()
 
     # ── [6] Streaming: N_STREAM weitere Token ─────────────────────────────
     print()
-    print("[6/6] Echtzeit-Streaming (T=", TEMPERATURE, ", vocab=",
-          lm.vocab_n, ") ...")
+    print("[6/6] Echtzeit-Streaming (T=", TEMPERATURE,
+          "  penalty=", REPETITION_PENALTY, "  vocab=", lm.vocab_n, ") ...")
     print()
     print("Gemma-4 E4B > ", end="")
     print(first_text, end="")
@@ -128,23 +155,29 @@ fn run(workers: Int) raises:
     var t_stream    = perf_counter_ns()
     var sum_step_ms = Float64(0.0)
     var generated   = List[Int]()
+    # Prompt-Token + erstes generiertes Token als Penalty-Basis
+    for pi in range(VALIDATION_PROMPT_LEN):
+        generated.append(prompt_ids[pi])
     generated.append(first_token)
 
     for step in range(1, N_STREAM + 1):
-        prepare_next_input(x, lm, generated[step - 1])
+        var prev_tok = generated[len(generated) - 1]
+        prepare_next_input(x, lm, prev_tok)
 
         var t_step = perf_counter_ns()
         for layer in range(E4B_N_LAYERS):
             engine.advance(layer)
             var w = engine.get_layer_ref(layer)
-            e4b_forward_layer(x, layer, w, kv, step, workers)
+            e4b_forward_layer(x, layer, w, kv, VALIDATION_PROMPT_LEN + step, workers)
         var step_ms = Float64(Int(perf_counter_ns() - t_step)) / 1e6
         sum_step_ms += step_ms
 
-        # LM-Head + Sampling
+        # Final RMSNorm + LM-Head + Repetition-Penalty Sampling
+        apply_final_norm(x, lm)
         var logits = Matrix(E4B_BATCH, lm.vocab_n)
         project_lm_head(logits, x, lm, workers)
-        var tok  = temperature_sampling(logits, TEMPERATURE)
+        var tok  = temperature_sampling(logits, TEMPERATURE,
+                                        generated, REPETITION_PENALTY)
         var text = token_map.decode(tok)
         generated.append(tok)
 

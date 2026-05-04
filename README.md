@@ -478,8 +478,12 @@ These are non-obvious API quirks discovered during development:
 - [x] Gemma-4 E4B converted: 1.973 GB, checksum 0x01B27076 **[PASS]**
 
 ### Phase 5 — Production Inference
-- [ ] Greedy sampler + temperature scaling
-- [ ] Real embedding lookup (weight-tied)
+- [x] Greedy sampler + temperature scaling
+- [x] Real embedding lookup (weight-tied, FP32 column extraction)
+- [x] **Final RMSNorm** — `model.language_model.norm.weight` angewendet nach Layer 41 (vor LM-Head)
+- [x] **LM-Head FP32** — Upgrade von INT4 auf FP32 (84 MB, `lm_head_proto.bin v2`)
+- [x] **Repetition Penalty** — `penalty=1.2` unterdrückt Token-Loops im Sampler
+- [x] Multi-Token Prompt Processing — vollständige Prompt-Verarbeitung (6 Token) vor Generierung
 - [ ] Continuous batching (variable sequence lengths)
 - [ ] KV-cache paged allocator (sliding window for Gemma 4 long context)
 - [ ] INT8 KV-cache (50% RAM reduction)

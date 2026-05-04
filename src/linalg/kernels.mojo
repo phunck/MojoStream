@@ -595,6 +595,82 @@ fn apply_rope_inplace(
             i += 1
 
 
+fn rmsnorm_weighted_inplace(x: PtrT, gamma: PtrT, n_rows: Int, n_cols: Int):
+    """RMSNorm with learned gamma weights: x[i] = (x[i] / rms(x)) * gamma[i].
+    Used for the final model.norm before the LM-Head."""
+    for row in range(n_rows):
+        var rp = x + row * n_cols
+        var sq = SIMD[DT, SIMD_W](0)
+        var i  = 0
+        while i < n_cols:
+            var v = rp.load[width=SIMD_W](i)
+            sq += v * v
+            i  += SIMD_W
+        var rms_inv = Float32(1.0) / sqrt(sq.reduce_add() / Float32(n_cols) + Float32(1e-6))
+        i = 0
+        while i < n_cols:
+            rp.store[width=SIMD_W](i, rp.load[width=SIMD_W](i) * rms_inv * gamma.load[width=SIMD_W](i))
+            i += SIMD_W
+
+
+fn matmul_fp32_raw(
+    C: Matrix,    # (M, N)
+    A: Matrix,    # (M, K)
+    b_ptr: PtrT,  # (K, N) FP32 row-major
+    b_cols: Int,  # = N
+    workers: Int = 0,
+):
+    """FP32 matrix multiply for high-precision LM-Head projection.
+    Reuses the same MR=4 tile blocking as the Q4 kernel."""
+    var M   = C.rows
+    var K   = A.cols
+    var N   = b_cols
+    var num_m_blocks = (M + BM - 1) // BM
+
+    @parameter
+    fn process_m_block(mb: Int):
+        var m0   = mb * BM
+        var m1   = min(m0 + BM, M)
+        var aptr = A.data()
+
+        for kt in range(0, K, BK):
+            var k1 = min(kt + BK, K)
+            var bk = k1 - kt
+            var nt = 0
+            while nt + NR <= N:
+                var m = m0
+                while m < m1:
+                    var acc00 = SIMD[DT, SIMD_W](0); var acc01 = SIMD[DT, SIMD_W](0)
+                    var acc10 = SIMD[DT, SIMD_W](0); var acc11 = SIMD[DT, SIMD_W](0)
+                    var acc20 = SIMD[DT, SIMD_W](0); var acc21 = SIMD[DT, SIMD_W](0)
+                    var acc30 = SIMD[DT, SIMD_W](0); var acc31 = SIMD[DT, SIMD_W](0)
+                    for k_local in range(bk):
+                        var b_row = b_ptr + (kt + k_local) * N
+                        var B0 = b_row.load[width=SIMD_W](nt)
+                        var B1 = b_row.load[width=SIMD_W](nt + SIMD_W)
+                        var base = m * K + kt + k_local
+                        var a0 = aptr.load(base);             var a1 = aptr.load(base + K)
+                        var a2 = aptr.load(base + 2 * K);    var a3 = aptr.load(base + 3 * K)
+                        acc00 = acc00 + a0 * B0;  acc01 = acc01 + a0 * B1
+                        acc10 = acc10 + a1 * B0;  acc11 = acc11 + a1 * B1
+                        acc20 = acc20 + a2 * B0;  acc21 = acc21 + a2 * B1
+                        acc30 = acc30 + a3 * B0;  acc31 = acc31 + a3 * B1
+                    var n1 = nt + SIMD_W
+                    C.store[SIMD_W](m,   nt, C.load[SIMD_W](m,   nt) + acc00)
+                    C.store[SIMD_W](m,   n1, C.load[SIMD_W](m,   n1) + acc01)
+                    C.store[SIMD_W](m+1, nt, C.load[SIMD_W](m+1, nt) + acc10)
+                    C.store[SIMD_W](m+1, n1, C.load[SIMD_W](m+1, n1) + acc11)
+                    C.store[SIMD_W](m+2, nt, C.load[SIMD_W](m+2, nt) + acc20)
+                    C.store[SIMD_W](m+2, n1, C.load[SIMD_W](m+2, n1) + acc21)
+                    C.store[SIMD_W](m+3, nt, C.load[SIMD_W](m+3, nt) + acc30)
+                    C.store[SIMD_W](m+3, n1, C.load[SIMD_W](m+3, n1) + acc31)
+                    m += MR
+                nt += NR
+
+    var w = workers if workers > 0 else num_logical_cores()
+    parallelize[process_m_block](num_m_blocks, w)
+
+
 fn silu_inplace(x: PtrT, n: Int):
     """SiLU in-place: x[i] = x[i] * sigmoid(x[i]) = x[i] / (1 + exp(–x[i]))."""
     var i = 0
